@@ -42,18 +42,19 @@ BASE_URL = (os.environ.get("BITMART_BASE_URL") or "https://demo-api-cloud-v2.bit
 LEVERAGE = (os.environ.get("LEVERAGE") or "25").strip()
 OPEN_TYPE = (os.environ.get("OPEN_TYPE") or "isolated").strip().lower()
 
-# >>> CE PARAMETRE = ce que tu veux réellement: la MARGIN prise dans le compte
-MARGIN_USD_PER_TRADE = float((os.environ.get("MARGIN_USD_PER_TRADE") or "100").strip())
+# >>> CE QUE TU VEUX: NOTIONAL FIXE (valeur de position)
+# Exemple: 2500 en 25x => margin ~100
+NOTIONAL_USD_PER_TRADE = float((os.environ.get("NOTIONAL_USD_PER_TRADE") or "2500").strip())
 
 # Cache leverage
 LEVERAGE_CACHE: Dict[str, Dict[str, Any]] = {}
 LEVERAGE_CACHE_TTL_SEC = 600
 
-# Cache contract details (contract_size etc.)
+# Cache contract details
 CONTRACT_DETAILS_CACHE: Dict[str, Dict[str, Any]] = {}
 CONTRACT_DETAILS_TTL_SEC = 600
 
-BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-per-symbol-margin-100").strip()
+BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-per-symbol-notional-2500").strip()
 
 # ================= DEBUG: derniers webhooks =================
 LAST_ALERTS: List[Dict[str, Any]] = []
@@ -102,6 +103,14 @@ def safe_float(v) -> float:
         return float(v)
     except Exception:
         return 0.0
+
+def safe_int(v) -> int:
+    try:
+        if v is None:
+            return 0
+        return int(float(v))
+    except Exception:
+        return 0
 
 def pick_last_low(data: Dict[str, Any]) -> float:
     for k in ["last_low", "swing_low", "sl", "stop", "low"]:
@@ -167,7 +176,7 @@ def bm_get_keyed(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
     except Exception as e:
         return {"http": 0, "error": str(e)}
 
-# ================= MARKET DATA (pour sizing margin) =================
+# ================= MARKET DATA (pour sizing notional) =================
 def get_contract_details(symbol: str) -> Tuple[bool, Dict[str, Any]]:
     now = int(time.time())
     cached = CONTRACT_DETAILS_CACHE.get(symbol)
@@ -180,7 +189,6 @@ def get_contract_details(symbol: str) -> Tuple[bool, Dict[str, Any]]:
         return False, {"error": "details_failed", "raw": res}
 
     data = j.get("data") or {}
-    # Certains retours peuvent contenir une liste; on supporte les 2
     if isinstance(data, list) and len(data) > 0:
         data = data[0]
 
@@ -189,7 +197,6 @@ def get_contract_details(symbol: str) -> Tuple[bool, Dict[str, Any]]:
     return True, data
 
 def get_last_price(symbol: str) -> Tuple[bool, float, Dict[str, Any]]:
-    # Endpoint public ticker futures v2 (structure peut varier; on gère plusieurs clés)
     res = bm_get_public("/contract/public/ticker", params={"symbol": symbol})
     j = res.get("json") or {}
     if j.get("code") != 1000:
@@ -199,7 +206,6 @@ def get_last_price(symbol: str) -> Tuple[bool, float, Dict[str, Any]]:
     if isinstance(data, list) and len(data) > 0:
         data = data[0]
 
-    # clés possibles: last_price / last / close / current_price
     for k in ["last_price", "last", "close", "current_price"]:
         px = safe_float(data.get(k))
         if px > 0:
@@ -217,12 +223,7 @@ def compute_contract_size(symbol: str) -> Tuple[bool, float, Dict[str, Any]]:
         return False, 0.0, {"error": "contract_size_missing", "details": det}
     return True, cs, det
 
-def compute_size_for_margin(symbol: str) -> Tuple[bool, int, Dict[str, Any]]:
-    # size = floor( (margin * leverage) / (price * contract_size) )
-    lev = safe_float(LEVERAGE)
-    if lev <= 0:
-        lev = 1.0
-
+def compute_size_for_notional(symbol: str) -> Tuple[bool, int, Dict[str, Any]]:
     ok_cs, contract_size, det = compute_contract_size(symbol)
     if not ok_cs:
         return False, 0, det
@@ -231,22 +232,71 @@ def compute_size_for_margin(symbol: str) -> Tuple[bool, int, Dict[str, Any]]:
     if not ok_px or price <= 0:
         return False, 0, raw_px
 
-    notional = MARGIN_USD_PER_TRADE * lev
-    est_contracts = notional / (price * contract_size)
-
+    est_contracts = NOTIONAL_USD_PER_TRADE / (price * contract_size)
     size = int(math.floor(est_contracts))
     if size < 1:
         size = 1
 
+    lev = safe_float(LEVERAGE) if safe_float(LEVERAGE) > 0 else 1.0
+    est_margin = NOTIONAL_USD_PER_TRADE / lev
+
     return True, size, {
         "symbol": symbol,
-        "margin_usd": MARGIN_USD_PER_TRADE,
+        "notional_usd": NOTIONAL_USD_PER_TRADE,
         "leverage": lev,
+        "est_margin_usd": est_margin,
         "price": price,
         "contract_size": contract_size,
         "computed_contracts": est_contracts,
         "size_int": size,
     }
+
+# ================= POSITION (pour fermer la taille réelle) =================
+def fetch_position_row(symbol: str) -> Tuple[bool, Optional[Dict[str, Any]], Dict[str, Any]]:
+    res = bm_get_keyed("/contract/private/position", params={"symbol": symbol})
+    j = res.get("json") or {}
+    if j.get("code") != 1000:
+        return (False, None, res)
+
+    data = j.get("data") or []
+    if not isinstance(data, list) or len(data) == 0:
+        return (True, None, res)
+
+    for it in data:
+        if (it.get("symbol") or "").upper() == symbol:
+            return (True, it, res)
+
+    return (True, data[0], res)
+
+def fetch_position_size(symbol: str) -> int:
+    ok, row, _raw = fetch_position_row(symbol)
+    if not ok or not row:
+        return 0
+    # current_amount est le nombre de contrats (souvent string)
+    return abs(safe_int(row.get("current_amount") or 0))
+
+def fetch_position_side(symbol: str) -> Optional[str]:
+    ok, row, _raw = fetch_position_row(symbol)
+    if not ok or not row:
+        return None
+    amt = safe_float(row.get("current_amount") or 0)
+    if amt == 0:
+        return None
+    ptype = str(row.get("position_type") or "")
+    if ptype == "1":
+        return "LONG"
+    if ptype == "2":
+        return "SHORT"
+    return "LONG" if amt > 0 else "SHORT"
+
+def resync_symbol(symbol: str) -> None:
+    side = fetch_position_side(symbol)
+    if side:
+        STATE[symbol].update({"in_position": True, "side": side})
+        print("RESYNC:", symbol, "FOUND POSITION", {"side": side}, flush=True)
+    else:
+        STATE[symbol].update({"in_position": False, "side": None})
+        print("RESYNC:", symbol, "NO POSITION", flush=True)
 
 # ================= BITMART ACTIONS =================
 def submit_leverage(symbol: str) -> Dict[str, Any]:
@@ -275,7 +325,7 @@ def ensure_leverage_synced(symbol: str) -> bool:
 def open_market(symbol: str, side: str) -> Dict[str, Any]:
     ensure_leverage_synced(symbol)
 
-    ok_sz, size, dbg = compute_size_for_margin(symbol)
+    ok_sz, size, dbg = compute_size_for_notional(symbol)
     if not ok_sz:
         print("SIZING ERROR:", symbol, dbg, flush=True)
         return {"http": 0, "json": {"code": -1, "message": "sizing_failed", "data": dbg}}
@@ -293,12 +343,11 @@ def open_market(symbol: str, side: str) -> Dict[str, Any]:
     })
 
 def close_market(symbol: str, side: str) -> Dict[str, Any]:
-    # close la taille "position" via reduce, mais ici on utilise size calculé minimal.
-    # Pour être strict, il faudrait récupérer la taille de position et fermer exactement.
-    # On garde le comportement actuel: fermer 'size' basé sur margin calc, ou 1 si sizing fail.
-    ok_sz, size, _dbg = compute_size_for_margin(symbol)
-    if not ok_sz:
-        size = 1
+    # ferme la taille réelle si possible
+    pos_size = fetch_position_size(symbol)
+    if pos_size <= 0:
+        ok_sz, size, _dbg = compute_size_for_notional(symbol)
+        pos_size = size if ok_sz else 1
 
     return bm_post("/contract/private/submit-order", {
         "symbol": symbol,
@@ -307,10 +356,14 @@ def close_market(symbol: str, side: str) -> Dict[str, Any]:
         "mode": 1,
         "leverage": LEVERAGE,
         "open_type": OPEN_TYPE,
-        "size": size
+        "size": pos_size
     })
 
 def set_stop_loss(symbol: str, side: str, price: float) -> Dict[str, Any]:
+    # on met la size de position si possible
+    pos_size = fetch_position_size(symbol)
+    if pos_size <= 0:
+        pos_size = 1
     return bm_post("/contract/private/submit-tp-sl-order", {
         "symbol": symbol,
         "type": "stop_loss",
@@ -320,53 +373,8 @@ def set_stop_loss(symbol: str, side: str, price: float) -> Dict[str, Any]:
         "price_type": 1,
         "plan_category": 2,
         "category": "market",
-        "size": 0  # 0 => laisser BitMart appliquer à la position (si supporté); sinon BitMart ignore/retourne erreur
+        "size": pos_size
     })
-
-# ================= POSITION RESYNC =================
-def fetch_position(symbol: str) -> Tuple[bool, Optional[str], Dict[str, Any]]:
-    res = bm_get_keyed("/contract/private/position", params={"symbol": symbol})
-    j = res.get("json") or {}
-    if j.get("code") != 1000:
-        return (False, None, res)
-
-    data = j.get("data") or []
-    if not isinstance(data, list) or len(data) == 0:
-        return (False, None, res)
-
-    row = None
-    for it in data:
-        if (it.get("symbol") or "").upper() == symbol:
-            row = it
-            break
-    if row is None:
-        row = data[0]
-
-    amt = safe_float(row.get("current_amount") or 0)
-    if amt == 0:
-        return (False, None, res)
-
-    ptype = str(row.get("position_type") or "")
-    if ptype == "1":
-        return (True, "LONG", res)
-    if ptype == "2":
-        return (True, "SHORT", res)
-
-    if amt > 0:
-        return (True, "LONG", res)
-    if amt < 0:
-        return (True, "SHORT", res)
-
-    return (True, None, res)
-
-def resync_symbol(symbol: str) -> None:
-    has_pos, side, raw = fetch_position(symbol)
-    if has_pos:
-        STATE[symbol].update({"in_position": True, "side": side})
-        print("RESYNC:", symbol, "FOUND POSITION", {"side": side}, flush=True)
-    else:
-        STATE[symbol].update({"in_position": False, "side": None})
-        print("RESYNC:", symbol, "NO POSITION", flush=True)
 
 # ================= ROUTES =================
 @app.get("/")
@@ -375,6 +383,7 @@ def home():
 
 @app.get("/version")
 def version():
+    lev = safe_float(LEVERAGE) if safe_float(LEVERAGE) > 0 else 1.0
     return jsonify({
         "bot_version": BOT_VERSION,
         "base_url": BASE_URL,
@@ -385,7 +394,8 @@ def version():
         "short_colors": sorted(list(SHORT_COLORS)),
         "secret_len": len(SECRET),
         "squeeze_on": SQUEEZE_ON,
-        "margin_usd_per_trade": MARGIN_USD_PER_TRADE,
+        "notional_usd_per_trade": NOTIONAL_USD_PER_TRADE,
+        "est_margin_usd_per_trade": NOTIONAL_USD_PER_TRADE / lev
     }), 200
 
 @app.get("/debug/state")
@@ -400,7 +410,7 @@ def debug_alerts():
 def debug_sizing():
     out = {}
     for sym in sorted(list(ALLOWED_SYMBOLS)):
-        ok, size, dbg = compute_size_for_margin(sym)
+        ok, size, dbg = compute_size_for_notional(sym)
         out[sym] = {"ok": ok, "size": size, "dbg": dbg}
     return jsonify(out), 200
 
