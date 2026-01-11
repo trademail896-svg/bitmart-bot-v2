@@ -1,313 +1,316 @@
 from flask import Flask, request, jsonify
 import os
-import time
 import json
-import hmac
-import hashlib
-import requests
 from datetime import datetime, timezone
 
 app = Flask(__name__)
 
 # =========================
-# CONFIG GLOBALE
+# CONFIG
 # =========================
-SECRET_EXPECTED = "TV_BOT_DEMO_2026_V2"
+SECRET = "TV_BOT_DEMO_2026_V2"
+
+# Symbols allowed (normalized)
 ALLOWED_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
-LEVERAGE = 25  # verrouillé comme tu veux
+# Vector colors (IMPORTANT: purple = pourpre)
+BULL_VECTORS = {"green", "blue"}
+BEAR_VECTORS = {"red", "purple"}
+
+# Global single-position mode
+STATE = {
+    "in_position": False,
+    "side": None,          # "LONG" or "SHORT"
+    "symbol": None,        # normalized
+    "entry_bar_key": None,
+
+    "squeeze_on": False,
+
+    # last signals
+    "last_stoch": None,    # {"reason":"LD/HD","bar_key":..., "ticker":...}
+    "last_vector": None,   # {"color":..., "bar_key":..., "ticker":...}
+
+    # lock
+    "last_action_bar_key": None,  # prevent double action same bar
+}
 
 # =========================
-# BITMART CONFIG (DEMO/REAL selon tes clés)
+# HELPERS
 # =========================
-BITMART_KEY = (os.environ.get("BITMART_API_KEY") or "").strip()
-BITMART_SECRET = (os.environ.get("BITMART_API_SECRET") or "").strip()
-BITMART_MEMO = (os.environ.get("BITMART_API_MEMO") or "").strip()
-
-# NOTE: adapte si tu utilises spot vs futures, demo vs live.
-# Ici je garde la structure; tu avais déjà un code BitMart fonctionnel.
-BASE_URL = (os.environ.get("BITMART_BASE_URL") or "https://api-cloud.bitmart.com").strip()
-
-# =========================
-# ETAT PAR SYMBOLE
-# =========================
-def blank_state():
-    return {
-        "in_position": False,
-        "side": None,                 # "LONG" / "SHORT"
-        "last_entry_bar_key": None,   # anti double entrée par bougie
-        "squeeze": False,             # filtre d’entrée
-        "sl_level": None,             # stop structurel (niveau)
-        "last_bar_key_seen": None,    # anti spam BAR_CLOSE
-        "position_open_time_ms": None
-    }
-
-STATE = {sym: blank_state() for sym in ALLOWED_SYMBOLS}
-
-# =========================
-# UTILITAIRES
-# =========================
-def now():
+def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-def log(msg: str):
-    print(f"[{now()}] {msg}", flush=True)
+def log(msg):
+    print(f"[{now_iso()}] {msg}", flush=True)
 
-def normalize_symbol(ticker_raw: str) -> str:
-    if not ticker_raw:
+def normalize_symbol(tv_ticker: str) -> str:
+    if not tv_ticker:
         return ""
-    t = ticker_raw.strip().upper()
+    t = tv_ticker.strip().upper()
+    # normalize BitMart perp format: BTCUSDT.P -> BTCUSDT
     if t.endswith(".P"):
         t = t[:-2]
     return t
 
-def is_opposite(a: str, b: str) -> bool:
-    return (a == "LONG" and b == "SHORT") or (a == "SHORT" and b == "LONG")
+def safe_float(x):
+    try:
+        if x is None:
+            return None
+        # handle strings like "90627.6"
+        return float(str(x).strip())
+    except Exception:
+        return None
 
-def ok(extra=None):
-    payload = {"ok": True}
-    if extra:
-        payload.update(extra)
-    return jsonify(payload), 200
+def parse_json_body():
+    raw = request.get_data(as_text=True) or ""
+    raw = raw.strip()
+    if not raw:
+        return None, raw, "empty body"
+    try:
+        return json.loads(raw), raw, None
+    except Exception as e:
+        return None, raw, f"json parse error: {e}"
 
-# =========================
-# BITMART SIGNING (si ton ancien bot l'utilisait déjà)
-# =========================
-def bm_timestamp_ms() -> str:
-    return str(int(time.time() * 1000))
-
-def bm_sign(message: str, secret: str) -> str:
-    return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
-
-def bm_headers(path: str, body: str) -> dict:
-    # BitMart signing depends on endpoint spec.
-    # On garde la structure classique: timestamp + memo + body + path
-    ts = bm_timestamp_ms()
-    prehash = ts + "#" + BITMART_MEMO + "#" + body
-    sign = bm_sign(prehash, BITMART_SECRET)
-
-    return {
-        "Content-Type": "application/json",
-        "X-BM-KEY": BITMART_KEY,
-        "X-BM-SIGN": sign,
-        "X-BM-TIMESTAMP": ts,
-        "X-BM-MEMO": BITMART_MEMO,
-    }
+def get_bar_key(payload: dict) -> str:
+    # bar_key optional; if missing, create a deterministic fallback
+    bk = payload.get("bar_key")
+    if bk:
+        return str(bk)
+    t = payload.get("ticker") or ""
+    tf = payload.get("tf") or payload.get("interval") or ""
+    tm = payload.get("time_ms") or payload.get("time") or ""
+    return f"{t}|{tf}|{tm}"
 
 # =========================
-# BITMART ACTIONS (stubs robustes)
-# IMPORTANT: tu avais déjà un code qui place les ordres.
-# Ici, je te donne une version "safe" : logs + appels.
+# BITMART PLACEHOLDERS
+# IMPORTANT: Replace these with your existing working BitMart DEMO functions.
 # =========================
-def bitmart_place_market_order(symbol: str, side: str):
+def bitmart_enter(symbol: str, side: str, leverage: int = 25):
     """
-    side: "LONG" -> buy/open long
-          "SHORT" -> sell/open short
+    side: 'LONG' or 'SHORT'
+    leverage: your standard leverage (25x)
+    Replace with your real BitMart API entry order.
     """
-    log(f"BITMART PLACE MARKET {side} {symbol} (leverage={LEVERAGE})")
-    # TODO: Remplacer avec tes endpoints exacts futures demo.
-    # On garde un stub pour ne pas casser ton déploiement.
-    return {"ok": True, "stub": True}
+    log(f"BITMART ENTER (stub) symbol={symbol} side={side} lev={leverage}")
+    return True, {"stub": True}
 
-def bitmart_close_position(symbol: str, side: str, reason: str):
-    log(f"BITMART CLOSE {side} {symbol} reason={reason}")
-    # TODO: Remplacer avec tes endpoints exacts futures demo.
-    return {"ok": True, "stub": True}
+def bitmart_exit(symbol: str, side: str):
+    """
+    Replace with your real BitMart API close position.
+    """
+    log(f"BITMART EXIT (stub) symbol={symbol} side={side}")
+    return True, {"stub": True}
 
 # =========================
-# LOGIQUE V2
+# STRATEGY LOGIC
 # =========================
-def handle_squeeze(st, data):
-    # event SQUEEZE : squeeze true/false
-    sq = data.get("squeeze", None)
-    if isinstance(sq, bool):
-        st["squeeze"] = sq
+def can_trade_symbol(symbol: str) -> bool:
+    return symbol in ALLOWED_SYMBOLS
+
+def try_entry():
+    """
+    ENTRY RULES:
+    LONG  = LD + (green/blue) + squeeze OFF
+    SHORT = HD + (red/purple) + squeeze OFF
+    """
+    if STATE["in_position"]:
+        return
+    if STATE["squeeze_on"]:
+        return
+
+    st = STATE["last_stoch"]
+    vx = STATE["last_vector"]
+    if not st or not vx:
+        return
+
+    # strict match: same bar_key (cleanest)
+    st_bk = st.get("bar_key")
+    vx_bk = vx.get("bar_key")
+    if not st_bk or not vx_bk:
+        return
+    if st_bk != vx_bk:
+        return
+
+    bar_key = st_bk
+    if STATE["last_action_bar_key"] == bar_key:
+        return
+
+    reason = (st.get("reason") or "").upper()  # LD/HD
+    color = (vx.get("color") or "").lower()
+
+    symbol = normalize_symbol(vx.get("ticker") or st.get("ticker") or "")
+    if not can_trade_symbol(symbol):
+        return
+
+    # LONG
+    if reason == "LD" and color in BULL_VECTORS:
+        ok, info = bitmart_enter(symbol, "LONG", leverage=25)
+        if ok:
+            STATE["in_position"] = True
+            STATE["side"] = "LONG"
+            STATE["symbol"] = symbol
+            STATE["entry_bar_key"] = bar_key
+            STATE["last_action_bar_key"] = bar_key
+            log(f"ENTRY ✅ LONG symbol={symbol} bar_key={bar_key} info={info}")
+        return
+
+    # SHORT
+    if reason == "HD" and color in BEAR_VECTORS:
+        ok, info = bitmart_enter(symbol, "SHORT", leverage=25)
+        if ok:
+            STATE["in_position"] = True
+            STATE["side"] = "SHORT"
+            STATE["symbol"] = symbol
+            STATE["entry_bar_key"] = bar_key
+            STATE["last_action_bar_key"] = bar_key
+            log(f"ENTRY ✅ SHORT symbol={symbol} bar_key={bar_key} info={info}")
+        return
+
+def do_exit(reason: str):
+    if not STATE["in_position"]:
+        return
+    symbol = STATE["symbol"]
+    side = STATE["side"]
+    ok, info = bitmart_exit(symbol, side)
+    if ok:
+        log(f"EXIT ✅ {side} symbol={symbol} reason={reason} info={info}")
+        STATE["in_position"] = False
+        STATE["side"] = None
+        STATE["symbol"] = None
+        STATE["entry_bar_key"] = None
     else:
-        # si squeeze vient en string
-        if str(sq).lower() == "true":
-            st["squeeze"] = True
-        elif str(sq).lower() == "false":
-            st["squeeze"] = False
-    log(f"SQUEEZE state updated: squeeze={st['squeeze']}")
+        log(f"EXIT ❌ {side} symbol={symbol} reason={reason} info={info}")
 
-def handle_bar_close(st, symbol, data):
-    # SL structurel sur clôture uniquement
-    bar_key = data.get("bar_key", "")
-    if bar_key and st["last_bar_key_seen"] == bar_key:
+def evaluate_exit(event: str, payload: dict):
+    """
+    EXIT RULES:
+    LONG exits if:
+      - EMA_EXIT side=LONG  (close below EMA5)
+      - STOCH_ENTRY reason=HD (opposite)
+      - VECTOR color in (red/purple)
+
+    SHORT exits if:
+      - EMA_EXIT side=SHORT (close above EMA5)
+      - STOCH_ENTRY reason=LD (opposite)
+      - VECTOR color in (green/blue)
+    """
+    if not STATE["in_position"]:
         return
 
-    st["last_bar_key_seen"] = bar_key
+    pos_side = STATE["side"]
 
-    if not st["in_position"]:
+    if event == "EMA_EXIT":
+        side = (payload.get("side") or "").upper()
+        if side == pos_side:
+            do_exit(payload.get("reason") or "EMA_EXIT")
         return
 
-    if st["sl_level"] is None:
+    if event == "STOCH_ENTRY":
+        r = (payload.get("reason") or "").upper()
+        if pos_side == "LONG" and r == "HD":
+            do_exit("STOCH_OPPOSITE_HD")
+        elif pos_side == "SHORT" and r == "LD":
+            do_exit("STOCH_OPPOSITE_LD")
         return
 
-    close = float(data.get("close", 0.0))
-
-    if st["side"] == "LONG":
-        if close <= st["sl_level"]:
-            bitmart_close_position(symbol, "LONG", reason="SL_CLOSE")
-            st.update(blank_state())
-            log(f"SL_CLOSE executed LONG {symbol} close={close} sl={st['sl_level']}")
-    elif st["side"] == "SHORT":
-        if close >= st["sl_level"]:
-            bitmart_close_position(symbol, "SHORT", reason="SL_CLOSE")
-            st.update(blank_state())
-            log(f"SL_CLOSE executed SHORT {symbol} close={close} sl={st['sl_level']}")
-
-def enter_position(st, symbol, side, data, reason):
-    bar_key = data.get("bar_key", "")
-    if st["last_entry_bar_key"] == bar_key and bar_key:
-        log(f"ENTRY blocked (same bar_key) {symbol} {side} bar_key={bar_key}")
+    if event == "VECTOR":
+        c = (payload.get("color") or "").lower()
+        if pos_side == "LONG" and c in BEAR_VECTORS:
+            do_exit(f"VECTOR_OPPOSITE_{c}")
+        elif pos_side == "SHORT" and c in BULL_VECTORS:
+            do_exit(f"VECTOR_OPPOSITE_{c}")
         return
-
-    if st["squeeze"]:
-        log(f"ENTRY blocked (squeeze=true) {symbol} {side}")
-        return
-
-    # Place entry
-    bitmart_place_market_order(symbol, side)
-
-    # Set state
-    st["in_position"] = True
-    st["side"] = side
-    st["last_entry_bar_key"] = bar_key
-    st["position_open_time_ms"] = data.get("time_ms", None)
-
-    # SL structurel initial basé sur bougie signal
-    low = float(data.get("low", 0.0))
-    high = float(data.get("high", 0.0))
-    st["sl_level"] = low if side == "LONG" else high
-
-    log(f"ENTER {side} {symbol} reason={reason} sl_level={st['sl_level']} bar_key={bar_key}")
-
-def exit_if_match(st, symbol, expected_side, reason):
-    if not st["in_position"]:
-        return
-    if st["side"] != expected_side:
-        return
-    bitmart_close_position(symbol, expected_side, reason=reason)
-    st.update(blank_state())
-    log(f"EXIT {expected_side} {symbol} reason={reason}")
-
-def handle_stoch_entry(st, symbol, data):
-    # attend: action ENTER_LONG/ENTER_SHORT et reason LD/HD...
-    action = (data.get("action") or "").upper()
-    reason = (data.get("reason") or "").upper()
-
-    if action == "ENTER_LONG":
-        # LONG = LD
-        if reason not in {"LD", "LD_POINT"}:
-            log(f"STOCH_ENTRY ignored (not LD) reason={reason}")
-            return
-        enter_position(st, symbol, "LONG", data, reason)
-        return
-
-    if action == "ENTER_SHORT":
-        # SHORT = HD
-        if reason not in {"HD", "HD_POINT"}:
-            log(f"STOCH_ENTRY ignored (not HD) reason={reason}")
-            return
-        enter_position(st, symbol, "SHORT", data, reason)
-        return
-
-def handle_stoch_exit(st, symbol, data):
-    # exit sur opposé
-    action = (data.get("action") or "").upper()
-    reason = (data.get("reason") or "").upper()
-
-    # On supporte EXIT_LONG / EXIT_SHORT (ou EXIT op)
-    if action == "EXIT_LONG":
-        exit_if_match(st, symbol, "LONG", reason=f"STOCH_EXIT:{reason or 'OPP'}")
-    elif action == "EXIT_SHORT":
-        exit_if_match(st, symbol, "SHORT", reason=f"STOCH_EXIT:{reason or 'OPP'}")
-
-def handle_vector(st, symbol, data):
-    # payload: side = LONG pour vector bullish, SHORT pour bearish
-    incoming_side = (data.get("side") or "").upper()
-    if not st["in_position"]:
-        return
-    if incoming_side in {"LONG", "SHORT"} and is_opposite(st["side"], incoming_side):
-        exit_if_match(st, symbol, st["side"], reason="VECTOR_OPP")
-
-def handle_ema_exit(st, symbol, data):
-    # payload: side=LONG => close long si en long
-    side = (data.get("side") or "").upper()
-    reason = (data.get("reason") or "").upper()
-    if side == "LONG":
-        exit_if_match(st, symbol, "LONG", reason=f"EMA5_EXIT:{reason or 'CLOSE_BELOW_EMA5'}")
-    elif side == "SHORT":
-        exit_if_match(st, symbol, "SHORT", reason=f"EMA5_EXIT:{reason or 'CLOSE_ABOVE_EMA5'}")
 
 # =========================
 # ROUTES
 # =========================
 @app.get("/")
 def health():
-    return "OK", 200
+    return jsonify({"ok": True, "time": now_iso(), "state": STATE})
 
 @app.post("/webhook")
 def webhook():
-    raw = request.get_data(as_text=True) or ""
-    log(f"POST /webhook raw_len={len(raw)} raw={raw[:800]}")
+    data, raw, err = parse_json_body()
+    log(f"POST /webhook raw_len={len(raw)} raw={raw[:2000]}")
 
-    try:
-        data = request.get_json(force=True, silent=False)
-    except Exception as e:
-        log(f"ERROR invalid JSON: {repr(e)}")
-        return ok({"error": "invalid_json"})
+    # Keep 200 for TV stability when message is bad
+    if err:
+        log(f"ERROR {err}")
+        return jsonify({"ok": False, "error": err}), 200
 
-    if not isinstance(data, dict):
-        log(f"ERROR json_not_object type={type(data)}")
-        return ok({"error": "json_not_object"})
+    # Secret validation
+    if (data.get("secret") or "").strip() != SECRET:
+        log("403 invalid secret")
+        return jsonify({"ok": False, "error": "invalid secret"}), 403
 
-    secret = (data.get("secret") or "").strip()
-    if secret != SECRET_EXPECTED:
-        log(f"FORBIDDEN bad_secret received='{secret}' expected='{SECRET_EXPECTED}'")
-        return jsonify({"ok": False, "error": "bad_secret"}), 403
-
-    ticker = data.get("ticker", "")
+    event = (data.get("event") or "").strip().upper()
+    ticker = data.get("ticker") or ""
     symbol = normalize_symbol(ticker)
-    if symbol not in ALLOWED_SYMBOLS:
-        log(f"IGNORED symbol_not_allowed: ticker={ticker} symbol={symbol}")
-        return ok({"ignored": True, "reason": "symbol_not_allowed"})
+    bar_key = get_bar_key(data)
 
-    event = (data.get("event") or "").upper()
-    st = STATE[symbol]
+    # parse ohlc (optional)
+    o = safe_float(data.get("open"))
+    h = safe_float(data.get("high"))
+    l = safe_float(data.get("low"))
+    c = safe_float(data.get("close"))
 
-    log(f"EVENT {event} symbol={symbol} in_position={st['in_position']} side={st['side']} squeeze={st['squeeze']} sl={st['sl_level']}")
+    log(f"EVENT {event} ticker={ticker} symbol={symbol} tf={data.get('tf')} bar_key={bar_key} in_position={STATE['in_position']} side={STATE['side']} squeeze={STATE['squeeze_on']}")
 
-    # ===== Dispatch =====
+    # --- SQUEEZE ---
     if event == "SQUEEZE":
-        handle_squeeze(st, data)
-        return ok()
+        # expects payload: {"on": true/false}
+        STATE["squeeze_on"] = bool(data.get("on"))
+        return jsonify({"ok": True, "event": "SQUEEZE", "on": STATE["squeeze_on"]}), 200
 
-    if event == "BAR_CLOSE":
-        handle_bar_close(st, symbol, data)
-        return ok()
-
-    if event == "EMA_EXIT":
-        handle_ema_exit(st, symbol, data)
-        return ok()
-
+    # --- VECTOR ---
     if event == "VECTOR":
-        handle_vector(st, symbol, data)
-        return ok()
+        color = (data.get("color") or "").lower().strip()
+        STATE["last_vector"] = {
+            "color": color,
+            "ticker": ticker,
+            "symbol": symbol,
+            "bar_key": bar_key,
+            "open": o, "high": h, "low": l, "close": c,
+        }
 
+        # exits first
+        evaluate_exit("VECTOR", data)
+        # then entry attempt
+        try_entry()
+
+        return jsonify({"ok": True, "event": "VECTOR", "color": color}), 200
+
+    # --- STOCH ENTRY (LD/HD) ---
     if event == "STOCH_ENTRY":
-        handle_stoch_entry(st, symbol, data)
-        return ok()
+        reason = (data.get("reason") or "").upper().strip()  # LD/HD
+        STATE["last_stoch"] = {
+            "reason": reason,
+            "ticker": ticker,
+            "symbol": symbol,
+            "bar_key": bar_key,
+            "close": c,
+        }
 
-    if event == "STOCH_EXIT":
-        handle_stoch_exit(st, symbol, data)
-        return ok()
+        # exits first
+        evaluate_exit("STOCH_ENTRY", data)
+        # then entry attempt
+        try_entry()
 
-    # si event inconnu, on log mais 200
-    log(f"UNKNOWN EVENT ignored: {event}")
-    return ok({"ignored": True, "reason": "unknown_event"})
+        return jsonify({"ok": True, "event": "STOCH_ENTRY", "reason": reason}), 200
+
+    # --- EMA EXIT (already working in your setup) ---
+    if event == "EMA_EXIT":
+        evaluate_exit("EMA_EXIT", data)
+        return jsonify({"ok": True, "event": "EMA_EXIT"}), 200
+
+    # --- BAR_CLOSE heartbeat (optional) ---
+    if event == "BAR_CLOSE":
+        return jsonify({"ok": True, "event": "BAR_CLOSE"}), 200
+
+    log(f"IGNORED unknown event={event}")
+    return jsonify({"ok": True, "ignored": True, "event": event}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
+    log(f"Starting server on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
