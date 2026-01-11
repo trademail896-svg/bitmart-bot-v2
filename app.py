@@ -41,7 +41,7 @@ BASE_URL = (os.environ.get("BITMART_BASE_URL") or "https://demo-api-cloud-v2.bit
 LEVERAGE = (os.environ.get("LEVERAGE") or "25").strip()
 OPEN_TYPE = (os.environ.get("OPEN_TYPE") or "isolated").strip().lower()
 
-# Ton objectif simple: 100$ à 25x => 2500$ notional
+# Objectif: 100$ à 25x => 2500$ notional
 NOTIONAL_USD_PER_TRADE = float((os.environ.get("NOTIONAL_USD_PER_TRADE") or "2500").strip())
 
 LEVERAGE_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -50,7 +50,7 @@ LEVERAGE_CACHE_TTL_SEC = 600
 CONTRACT_DETAILS_CACHE: Dict[str, Dict[str, Any]] = {}
 CONTRACT_DETAILS_TTL_SEC = 600
 
-BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-per-symbol-notional-2500-FIX").strip()
+BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-per-symbol-notional-2500-FIX-404").strip()
 
 LAST_ALERTS: List[Dict[str, Any]] = []
 LAST_ALERTS_MAX = 30
@@ -171,7 +171,7 @@ def bm_get_keyed(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
     except Exception as e:
         return {"http": 0, "error": str(e)}
 
-# ================= DETAILS / PRICE =================
+# ================= DETAILS (contract_size + last_price) =================
 def get_details_payload(symbol: str) -> Tuple[bool, Dict[str, Any]]:
     now = int(time.time())
     cached = CONTRACT_DETAILS_CACHE.get(symbol)
@@ -184,11 +184,10 @@ def get_details_payload(symbol: str) -> Tuple[bool, Dict[str, Any]]:
         return False, {"error": "details_failed", "raw": res}
 
     data = j.get("data") or {}
-    # IMPORTANT: tu as un format data={"symbols":[...]}
+    # Format connu: data={"symbols":[...]}
     if isinstance(data, dict) and "symbols" in data:
         payload = data
     else:
-        # fallback si BitMart change le format
         payload = {"symbols": data if isinstance(data, list) else [data]}
 
     payload["_ts"] = now
@@ -204,46 +203,34 @@ def extract_symbol_row(details_payload: Dict[str, Any], symbol: str) -> Optional
             return it
     return syms[0]
 
-def get_contract_size(symbol: str) -> Tuple[bool, float, Dict[str, Any]]:
+def get_contract_size_and_price(symbol: str) -> Tuple[bool, float, float, Dict[str, Any]]:
     ok, payload = get_details_payload(symbol)
     if not ok:
-        return False, 0.0, payload
+        return False, 0.0, 0.0, payload
 
     row = extract_symbol_row(payload, symbol)
     if not row:
-        return False, 0.0, {"error": "details_no_row", "details": payload}
+        return False, 0.0, 0.0, {"error": "details_no_row", "details": payload}
 
     cs = safe_float(row.get("contract_size"))
+    px = safe_float(row.get("last_price"))  # IMPORTANT: on utilise last_price ici (pas /ticker)
+
     if cs <= 0:
-        return False, 0.0, {"error": "contract_size_missing", "row": row, "details": payload}
+        return False, 0.0, 0.0, {"error": "contract_size_missing", "row": row}
+    if px <= 0:
+        # ce n'est pas fatal, on pourra utiliser le close du webhook
+        px = 0.0
 
-    return True, cs, {"row": row}
+    return True, cs, px, {"row": row}
 
-def get_last_price(symbol: str) -> Tuple[bool, float, Dict[str, Any]]:
-    res = bm_get_public("/contract/public/ticker", params={"symbol": symbol})
-    j = res.get("json") or {}
-    if j.get("code") != 1000:
-        return False, 0.0, res
+def compute_size_for_notional(symbol: str, price_fallback: float) -> Tuple[bool, int, Dict[str, Any]]:
+    ok, contract_size, last_price, dbg = get_contract_size_and_price(symbol)
+    if not ok:
+        return False, 0, dbg
 
-    data = j.get("data") or {}
-    if isinstance(data, list) and len(data) > 0:
-        data = data[0]
-
-    for k in ["last_price", "last", "close", "current_price"]:
-        px = safe_float(data.get(k))
-        if px > 0:
-            return True, px, res
-
-    return False, 0.0, {"error": "price_key_not_found", "raw": res}
-
-def compute_size_for_notional(symbol: str) -> Tuple[bool, int, Dict[str, Any]]:
-    ok_cs, contract_size, dbg_cs = get_contract_size(symbol)
-    if not ok_cs:
-        return False, 0, dbg_cs
-
-    ok_px, price, dbg_px = get_last_price(symbol)
-    if not ok_px or price <= 0:
-        return False, 0, dbg_px
+    price = last_price if last_price > 0 else price_fallback
+    if price <= 0:
+        return False, 0, {"error": "no_price_available", "symbol": symbol, "last_price": last_price, "fallback": price_fallback}
 
     est_contracts = NOTIONAL_USD_PER_TRADE / (price * contract_size)
     size = int(math.floor(est_contracts))
@@ -258,7 +245,7 @@ def compute_size_for_notional(symbol: str) -> Tuple[bool, int, Dict[str, Any]]:
         "notional_usd": NOTIONAL_USD_PER_TRADE,
         "leverage": lev,
         "est_margin_usd": est_margin,
-        "price": price,
+        "price_used": price,
         "contract_size": contract_size,
         "computed_contracts": est_contracts,
         "size_int": size
@@ -334,10 +321,10 @@ def ensure_leverage_synced(symbol: str) -> bool:
         return True
     return False
 
-def open_market(symbol: str, side: str) -> Dict[str, Any]:
+def open_market(symbol: str, side: str, price_hint: float) -> Dict[str, Any]:
     ensure_leverage_synced(symbol)
 
-    ok_sz, size, dbg = compute_size_for_notional(symbol)
+    ok_sz, size, dbg = compute_size_for_notional(symbol, price_hint)
     if not ok_sz:
         print("SIZING ERROR:", symbol, dbg, flush=True)
         return {"http": 0, "json": {"code": -1, "message": "sizing_failed", "data": dbg}}
@@ -357,8 +344,7 @@ def open_market(symbol: str, side: str) -> Dict[str, Any]:
 def close_market(symbol: str, side: str) -> Dict[str, Any]:
     pos_size = fetch_position_size(symbol)
     if pos_size <= 0:
-        ok_sz, size, _dbg = compute_size_for_notional(symbol)
-        pos_size = size if ok_sz else 1
+        pos_size = 1
 
     return bm_post("/contract/private/submit-order", {
         "symbol": symbol,
@@ -410,7 +396,8 @@ def version():
 def debug_sizing():
     out = {}
     for sym in sorted(list(ALLOWED_SYMBOLS)):
-        ok, size, dbg = compute_size_for_notional(sym)
+        # ici on met un fallback price=0, le bot utilisera last_price depuis details
+        ok, size, dbg = compute_size_for_notional(sym, 0.0)
         out[sym] = {"ok": ok, "size": size, "dbg": dbg}
     return jsonify(out), 200
 
@@ -447,6 +434,9 @@ def webhook():
     symbol = normalize_symbol(data.get("ticker"))
     tf = str(data.get("tf") or "")
     t = str(data.get("time") or data.get("time_ms") or "")
+
+    # prix fallback: on utilise close du webhook si présent
+    price_hint = safe_float(data.get("close")) or safe_float(data.get("open")) or safe_float(data.get("high")) or safe_float(data.get("low"))
 
     if symbol not in ALLOWED_SYMBOLS and event not in {"RESET", "SQUEEZE"}:
         return jsonify({"status": "ignored_symbol"}), 200
@@ -523,7 +513,7 @@ def webhook():
             if st["last_entry_bar_key"] == bar_key:
                 return jsonify({"status": "ignored_same_bar", "symbol": symbol}), 200
 
-            res_entry = open_market(symbol, "LONG")
+            res_entry = open_market(symbol, "LONG", price_hint)
             if extract_code(res_entry) != 1000:
                 return jsonify({"status": "entry_failed", "symbol": symbol, "bitmart": res_entry}), 200
 
@@ -541,7 +531,7 @@ def webhook():
             if st["last_entry_bar_key"] == bar_key:
                 return jsonify({"status": "ignored_same_bar", "symbol": symbol}), 200
 
-            res_entry = open_market(symbol, "SHORT")
+            res_entry = open_market(symbol, "SHORT", price_hint)
             if extract_code(res_entry) != 1000:
                 return jsonify({"status": "entry_failed", "symbol": symbol, "bitmart": res_entry}), 200
 
@@ -569,7 +559,7 @@ def webhook():
         if st["last_entry_bar_key"] == bar_key:
             return jsonify({"status": "ignored_same_bar", "symbol": symbol}), 200
 
-        res_entry = open_market(symbol, inferred_side)
+        res_entry = open_market(symbol, inferred_side, price_hint)
         if extract_code(res_entry) != 1000:
             return jsonify({"status": "entry_failed", "symbol": symbol, "bitmart": res_entry}), 200
 
