@@ -5,7 +5,7 @@ import json
 import hmac
 import hashlib
 import requests
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 app = Flask(__name__)
 
@@ -24,7 +24,8 @@ STATE: Dict[str, Any] = {
     "squeeze_on": False
 }
 
-SECRET = "TV_BOT_DEMO_2026_V2"
+# IMPORTANT: doit matcher TradingView
+SECRET = (os.environ.get("TV_WEBHOOK_SECRET") or "TV_BOT_DEMO_2026_V2").strip()
 
 # ================= BITMART CONFIG =================
 BITMART_KEY = (os.environ.get("BITMART_API_KEY") or "").strip()
@@ -32,9 +33,9 @@ BITMART_SECRET = (os.environ.get("BITMART_API_SECRET") or "").strip()
 BITMART_MEMO = (os.environ.get("BITMART_API_MEMO") or "").strip()
 
 # DEMO
-BASE_URL = "https://demo-api-cloud-v2.bitmart.com"
+BASE_URL = (os.environ.get("BITMART_BASE_URL") or "https://demo-api-cloud-v2.bitmart.com").strip()
 
-# Leverage (tu veux 25x partout)
+# Leverage (par défaut 25x)
 LEVERAGE = (os.environ.get("LEVERAGE") or "25").strip()
 OPEN_TYPE = (os.environ.get("OPEN_TYPE") or "isolated").strip().lower()  # "isolated" ou "cross"
 
@@ -42,7 +43,11 @@ OPEN_TYPE = (os.environ.get("OPEN_TYPE") or "isolated").strip().lower()  # "isol
 LEVERAGE_CACHE: Dict[str, Dict[str, Any]] = {}
 LEVERAGE_CACHE_TTL_SEC = 600  # 10 minutes
 
-BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-clean-debug").strip()
+BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-clean-full").strip()
+
+# ================= DEBUG: derniers webhooks =================
+LAST_ALERTS: List[Dict[str, Any]] = []
+LAST_ALERTS_MAX = 20
 
 # ================= UTILS =================
 def normalize_symbol(s: str) -> str:
@@ -257,12 +262,20 @@ def version():
         "bot_version": BOT_VERSION,
         "base_url": BASE_URL,
         "leverage": LEVERAGE,
-        "open_type": OPEN_TYPE
+        "open_type": OPEN_TYPE,
+        "allowed_symbols": sorted(list(ALLOWED_SYMBOLS)),
+        "long_colors": sorted(list(LONG_COLORS)),
+        "short_colors": sorted(list(SHORT_COLORS)),
+        "secret_len": len(SECRET)  # debug sans exposer
     }), 200
 
 @app.get("/debug/state")
 def debug_state():
     return jsonify({"state": STATE}), 200
+
+@app.get("/debug/alerts")
+def debug_alerts():
+    return jsonify({"count": len(LAST_ALERTS), "alerts": LAST_ALERTS}), 200
 
 @app.get("/debug/bitmart")
 def debug_bitmart():
@@ -287,6 +300,11 @@ def webhook():
 
     if data.get("secret") != SECRET:
         return jsonify({"status": "forbidden"}), 403
+
+    # garde en mémoire les 20 derniers payloads
+    LAST_ALERTS.append(data)
+    if len(LAST_ALERTS) > LAST_ALERTS_MAX:
+        LAST_ALERTS.pop(0)
 
     print("ALERTE:", data, flush=True)
 
