@@ -4,57 +4,121 @@ import time
 import json
 import hmac
 import hashlib
+import threading
 import requests
+from typing import Optional, Dict, Any, Tuple
 
 app = Flask(__name__)
 
-# ================= STRATEGIE =================
-LONG_COLORS = {"green", "blue"}
-SHORT_COLORS = {"red", "pink", "purple"}
+# ================= CONFIG / STRATEGIE =================
 ALLOWED_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
-# Mode B : une seule position globale à la fois (comme tu le veux)
-STATE = {
-    "in_position": False,
-    "side": None,               # "LONG" ou "SHORT"
-    "symbol": None,             # "BTCUSDT", etc.
-    "last_entry_bar_key": None  # lock anti double entrée sur la même bougie
-}
+LONG_COLORS = {"green", "blue"}
+SHORT_COLORS = {"red", "pink", "purple"}
 
-SECRET = "TV_BOT_DEMO_2026"
+# Secret V2 (Render env: TV_WEBHOOK_SECRET=TV_BOT_DEMO_2026_V2)
+SECRET = (os.environ.get("TV_WEBHOOK_SECRET") or "TV_BOT_DEMO_2026_V2").strip()
+
+# Levier global (Render env: LEVERAGE=25)
+LEVERAGE = str(int(os.environ.get("LEVERAGE", "25")))
 
 # ================= BITMART CONFIG =================
 BITMART_KEY = (os.environ.get("BITMART_API_KEY") or "").strip()
 BITMART_SECRET = (os.environ.get("BITMART_API_SECRET") or "").strip()
 BITMART_MEMO = (os.environ.get("BITMART_API_MEMO") or "").strip()
 
-BASE_URL = "https://demo-api-cloud-v2.bitmart.com"
+# DEMO
+BASE_URL = (os.environ.get("BITMART_BASE_URL") or "https://demo-api-cloud-v2.bitmart.com").strip()
+
+# ================= THREAD SAFETY =================
+STATE_LOCK = threading.Lock()
+
+# ================= STATE (PAR SYMBOLE) =================
+def new_symbol_state() -> Dict[str, Any]:
+    return {
+        "in_position": False,
+        "side": None,                 # "LONG" / "SHORT"
+        "pos_size": None,             # taille détectée (si possible)
+        "last_entry_bar_key": None,   # anti-double entry
+        "squeeze": False,             # mis à jour via event SQUEEZE_STATE
+    }
+
+STATE: Dict[str, Dict[str, Any]] = {s: new_symbol_state() for s in ALLOWED_SYMBOLS}
+
 
 # ================= UTILS =================
 def normalize_symbol(s: str) -> str:
-    """
-    TradingView peut envoyer:
-      - BTCUSDT
-      - BTCUSDT.P  (perp)
-    On normalise pour matcher ALLOWED_SYMBOLS et BitMart.
-    """
     sym = (s or "").upper().strip()
     if sym.endswith(".P"):
         sym = sym[:-2]
     return sym
 
+def safe_float(x, default=0.0) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, str) and x.strip() == "":
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def safe_bool(x, default=False) -> bool:
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, str):
+        v = x.strip().lower()
+        if v in {"true", "1", "yes", "y"}:
+            return True
+        if v in {"false", "0", "no", "n"}:
+            return False
+    if isinstance(x, (int, float)):
+        return bool(x)
+    return default
+
 def get_size(symbol: str) -> int:
-    # size Futures = int, on force >= 1
+    # Size Futures = int (BitMart). On force >= 1.
     try:
         n = int(os.environ.get(f"SIZE_{symbol}", "1"))
         return max(1, n)
     except Exception:
         return 1
 
-def extract_code(res: dict):
-    j = res.get("json") or {}
-    return j.get("code")
+def extract_code(res: dict) -> Optional[int]:
+    j = res.get("json") if isinstance(res, dict) else None
+    if not isinstance(j, dict):
+        return None
+    try:
+        return int(j.get("code"))
+    except Exception:
+        return None
 
+def make_bar_key(symbol: str, tf: str, t: str, side: str, signal: str) -> str:
+    return f"{symbol}|{tf or ''}|{t or ''}|{side or ''}|{signal or ''}"
+
+def parse_incoming_data() -> Dict[str, Any]:
+    """
+    TradingView envoie parfois du JSON en text/plain.
+    Cette fonction lit:
+      - application/json (request.get_json)
+      - ou du texte JSON brut (request.data)
+    """
+    data = request.get_json(silent=True)
+    if isinstance(data, dict):
+        return data
+
+    # Fallback text/plain
+    try:
+        raw = request.data.decode("utf-8", errors="ignore").strip()
+        if raw:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+
+    return {}
+
+# ================= SIGNATURE / HTTP =================
 def sign_request(timestamp: int, body: dict) -> str:
     """
     BitMart signature (cloud v2):
@@ -93,9 +157,10 @@ def bm_post(path: str, body: dict) -> dict:
     except Exception as e:
         return {"http": 0, "error": str(e)}
 
-def bm_get_keyed(path: str, params: dict | None = None) -> dict:
+def bm_get_keyed(path: str, params: Optional[dict] = None) -> dict:
     """
-    KEYED endpoints: en pratique, BitMart accepte X-BM-KEY.
+    GET "keyed" (comme ton V1). Note: selon permissions, BitMart peut exiger GET signé.
+    On garde la version keyed pour compat, mais on gère les erreurs proprement.
     """
     headers = {"X-BM-KEY": BITMART_KEY}
     try:
@@ -107,14 +172,6 @@ def bm_get_keyed(path: str, params: dict | None = None) -> dict:
     except Exception as e:
         return {"http": 0, "error": str(e)}
 
-def make_bar_key(symbol: str, tf: str | None, t: str | None, side: str | None) -> str:
-    """
-    Lock par bougie ET par direction (LONG/SHORT) :
-    - bleu->vert (même bougie) = même bar_key => pas de double entry
-    - rose/pourpre->rouge (même bougie) = même bar_key => pas de double entry
-    """
-    return f"{symbol}|{tf or ''}|{t or ''}|{side or ''}"
-
 # ================= BITMART ACTIONS =================
 def open_market(symbol: str, side: str) -> dict:
     return bm_post("/contract/private/submit-order", {
@@ -122,52 +179,54 @@ def open_market(symbol: str, side: str) -> dict:
         "type": "market",
         "side": 1 if side == "LONG" else 4,   # 1=buy open, 4=sell open
         "mode": 1,
-        "leverage": "1",
+        "leverage": LEVERAGE,
         "open_type": "isolated",
         "size": get_size(symbol)
     })
 
-def close_market(symbol: str, side: str) -> dict:
+def close_market(symbol: str, side: str, size: Optional[int] = None) -> dict:
     return bm_post("/contract/private/submit-order", {
         "symbol": symbol,
         "type": "market",
         "side": 3 if side == "LONG" else 2,   # 3=sell close, 2=buy close
         "mode": 1,
-        "leverage": "1",
+        "leverage": LEVERAGE,
         "open_type": "isolated",
-        "size": get_size(symbol)
+        "size": int(size) if size is not None else get_size(symbol)
     })
 
-def set_stop_loss(symbol: str, side: str, price: float) -> dict:
+def set_stop_loss(symbol: str, side: str, price: float, size: Optional[int] = None) -> dict:
+    """
+    IMPORTANT: le tick size peut rendre certains prix invalides.
+    Ici on envoie le prix tel quel (string) sans forcer .2f.
+    """
+    p = str(price)
     return bm_post("/contract/private/submit-tp-sl-order", {
         "symbol": symbol,
         "type": "stop_loss",
-        "side": 3 if side == "LONG" else 2,
-        "trigger_price": f"{price:.2f}",
-        "executive_price": f"{price:.2f}",
+        "side": 3 if side == "LONG" else 2,   # close side
+        "trigger_price": p,
+        "executive_price": p,
         "price_type": 1,
         "plan_category": 2,
         "category": "market",
-        "size": get_size(symbol)
+        "size": int(size) if size is not None else get_size(symbol)
     })
 
-# ================= POSITION RESYNC (CRITIQUE) =================
-def fetch_position(symbol: str) -> tuple[bool, str | None, dict]:
+# ================= POSITION RESYNC =================
+def fetch_position(symbol: str) -> Tuple[Optional[bool], Optional[str], Optional[int], dict]:
     """
-    Retourne: (has_position, side, raw_response)
-
-    /contract/private/position est généralement suffisant pour détecter une position ouverte.
-    On considère ouverte si current_amount != 0.
-    position_type: 1=long, 2=short (si présent).
+    Retourne: (has_position, side, abs_size_int, raw)
+    has_position=None => inconnu (API fail). On ne conclut pas flat.
     """
     res = bm_get_keyed("/contract/private/position", params={"symbol": symbol})
-    j = res.get("json") or {}
-    if j.get("code") != 1000:
-        return (False, None, res)
+    j = res.get("json") if isinstance(res, dict) else None
+    if not isinstance(j, dict) or j.get("code") != 1000:
+        return (None, None, None, res)
 
     data = j.get("data") or []
     if not isinstance(data, list) or len(data) == 0:
-        return (False, None, res)
+        return (False, None, None, res)
 
     row = None
     for it in data:
@@ -177,198 +236,184 @@ def fetch_position(symbol: str) -> tuple[bool, str | None, dict]:
     if row is None:
         row = data[0]
 
-    try:
-        amt = float(row.get("current_amount") or 0)
-    except Exception:
-        amt = 0.0
-
+    amt = safe_float(row.get("current_amount"), 0.0)
     if amt == 0:
-        return (False, None, res)
+        return (False, None, None, res)
 
     ptype = row.get("position_type")
+    side = None
     if str(ptype) == "1":
-        return (True, "LONG", res)
-    if str(ptype) == "2":
-        return (True, "SHORT", res)
+        side = "LONG"
+    elif str(ptype) == "2":
+        side = "SHORT"
+    else:
+        side = "LONG" if amt > 0 else "SHORT"
 
-    # Fallback si position_type absent : signe de current_amount
-    if amt > 0:
-        return (True, "LONG", res)
-    if amt < 0:
-        return (True, "SHORT", res)
+    abs_size = int(abs(round(amt)))
+    abs_size = max(1, abs_size)
+    return (True, side, abs_size, res)
 
-    return (True, None, res)
+def resync_symbol(symbol: str) -> None:
+    st = STATE[symbol]
+    has_pos, side, abs_size, raw = fetch_position(symbol)
+    if has_pos is None:
+        print("RESYNC UNKNOWN (API FAIL)", {"symbol": symbol, "raw": raw})
+        return
+    if has_pos is False:
+        st.update({"in_position": False, "side": None, "pos_size": None})
+        print("RESYNC FLAT", {"symbol": symbol})
+        return
+    st.update({"in_position": True, "side": side, "pos_size": abs_size})
+    print("RESYNC FOUND POSITION", {"symbol": symbol, "side": side, "size": abs_size})
 
-def resync_global_state(preferred_symbol: str | None = None) -> None:
-    """
-    Mode B = une seule position globale.
-    On cherche une position ouverte sur les symbols autorisés, et on aligne STATE sur BitMart.
-    """
-    symbols = [preferred_symbol] if preferred_symbol else []
-    symbols += [s for s in ALLOWED_SYMBOLS if s != preferred_symbol]
-
-    for sym in symbols:
-        has_pos, side, _raw = fetch_position(sym)
-        if has_pos:
-            STATE.update({
-                "in_position": True,
-                "symbol": sym,
-                "side": side
-            })
-            print("RESYNC: FOUND OPEN POSITION ON BITMART", {"symbol": sym, "side": side})
-            return
-
-    STATE.update({"in_position": False, "symbol": None, "side": None})
-    print("RESYNC: NO OPEN POSITION ON BITMART")
+def resync_all() -> None:
+    for s in ALLOWED_SYMBOLS:
+        resync_symbol(s)
 
 # ================= ROUTES =================
 @app.get("/")
 def home():
-    return "Bot TradingView DEMO actif"
+    return "BitMart Bot V2 actif (multi-symbol, squeeze feed, 25x)"
 
 @app.post("/webhook")
 def webhook():
-    data = request.get_json(silent=True) or {}
+    data = parse_incoming_data()
 
     # Sécurité
     if data.get("secret") != SECRET:
+        print("FORBIDDEN: bad/missing secret. received=", data.get("secret"))
         return jsonify({"status": "forbidden"}), 403
 
-    print("ALERTE:", data)
-
-    event = data.get("event")
-    action = data.get("action")
-    color = (data.get("color") or "").lower()
+    event = (data.get("event") or "").upper().strip()
+    action = (data.get("action") or "").upper().strip()
+    color = (data.get("color") or "").lower().strip()
 
     symbol = normalize_symbol(data.get("ticker"))
     tf = str(data.get("tf") or "")
     t = str(data.get("time") or "")
 
-    if symbol not in ALLOWED_SYMBOLS and event != "RESET":
-        print("IGNORED SYMBOL:", symbol)
+    # RESET: autorisé même sans symbole valide
+    if event != "RESET" and symbol not in ALLOWED_SYMBOLS:
+        print("IGNORED SYMBOL:", symbol, "event:", event)
         return jsonify({"status": "ignored_symbol"}), 200
 
-    # ===== RESET (SAFE) =====
-    if event == "RESET":
-        resync_global_state(preferred_symbol=symbol if symbol in ALLOWED_SYMBOLS else None)
-        STATE["last_entry_bar_key"] = None
-        print("STATE RESET (SAFE) OK", STATE)
-        return jsonify({"status": "state_resynced", "state": STATE}), 200
+    with STATE_LOCK:
+        # ========== RESET ==========
+        if event == "RESET":
+            # si ticker fourni et autorisé => resync seulement celui-là, sinon tous
+            if symbol in ALLOWED_SYMBOLS:
+                resync_symbol(symbol)
+                STATE[symbol]["last_entry_bar_key"] = None
+            else:
+                resync_all()
+                for s in ALLOWED_SYMBOLS:
+                    STATE[s]["last_entry_bar_key"] = None
+            return jsonify({"status": "state_resynced", "state": STATE}), 200
 
-    # Mode B : une seule position globale
-    if STATE["in_position"] and STATE["symbol"] != symbol:
-        print(f"IGNORED OTHER SYMBOL open={STATE['symbol']} got={symbol}")
-        return jsonify({"status": "ignored_other_symbol"}), 200
+        st = STATE[symbol]
 
-    # ========== SORTIES ==========
-    # Si on reçoit une demande d'EXIT mais STATE est flat -> RESYNC (cas reboot Render)
-    if action in {"EXIT_LONG", "EXIT_SHORT"} and not STATE["in_position"]:
-        print("EXIT RECEIVED BUT STATE FLAT -> RESYNC")
-        resync_global_state(preferred_symbol=symbol)
+        # ========== SQUEEZE STATE FEED ==========
+        if event == "SQUEEZE_STATE":
+            sq = safe_bool(data.get("squeeze"), st["squeeze"])
+            st["squeeze"] = sq
+            print("SQUEEZE UPDATE:", {"symbol": symbol, "squeeze": sq})
+            return jsonify({"status": "squeeze_updated", "symbol": symbol, "squeeze": sq}), 200
 
-    if STATE["in_position"]:
-        # Sortie via Stoch (ou autre)
-        if action in {"EXIT_LONG", "EXIT_SHORT"}:
-            print("EXIT POSITION (STOCH)", STATE)
-            res = close_market(STATE["symbol"], STATE["side"])
-            print("BITMART CLOSE:", res)
+        # ========== SORTIES (compat V1) ==========
+        # Si on reçoit EXIT_* mais état local flat => resync symbole (cas reboot)
+        if action in {"EXIT_LONG", "EXIT_SHORT"} and not st["in_position"]:
+            print("EXIT RECEIVED BUT STATE FLAT -> RESYNC", {"symbol": symbol})
+            resync_symbol(symbol)
 
-            if extract_code(res) == 1000:
-                STATE.update({"in_position": False, "side": None, "symbol": None})
-                return jsonify({"status": "exit"}), 200
+        if st["in_position"]:
+            # Sortie explicite (Stoch / autre)
+            if action in {"EXIT_LONG", "EXIT_SHORT"}:
+                print("EXIT POSITION (ACTION)", {"symbol": symbol, "state": st, "action": action})
+                size_to_close = st.get("pos_size") or get_size(symbol)
+                res = close_market(symbol, st["side"], size=size_to_close)
+                print("BITMART CLOSE:", res)
 
-            print("CLOSE FAILED - KEEPING STATE", STATE)
-            return jsonify({"status": "close_failed", "bitmart": res}), 200
+                if extract_code(res) == 1000:
+                    st.update({"in_position": False, "side": None, "pos_size": None})
+                    return jsonify({"status": "exit"}), 200
 
-        # Sortie via vecteur opposé
+                return jsonify({"status": "close_failed", "bitmart": res}), 200
+
+            # Sortie via vecteur opposé (si event VECTOR)
+            if event == "VECTOR":
+                if st["side"] == "LONG" and color in SHORT_COLORS:
+                    size_to_close = st.get("pos_size") or get_size(symbol)
+                    res = close_market(symbol, "LONG", size=size_to_close)
+                    print("EXIT LONG (VECTOR OPP)", res)
+                    if extract_code(res) == 1000:
+                        st.update({"in_position": False, "side": None, "pos_size": None})
+                        return jsonify({"status": "exit"}), 200
+                    return jsonify({"status": "close_failed", "bitmart": res}), 200
+
+                if st["side"] == "SHORT" and color in LONG_COLORS:
+                    size_to_close = st.get("pos_size") or get_size(symbol)
+                    res = close_market(symbol, "SHORT", size=size_to_close)
+                    print("EXIT SHORT (VECTOR OPP)", res)
+                    if extract_code(res) == 1000:
+                        st.update({"in_position": False, "side": None, "pos_size": None})
+                        return jsonify({"status": "exit"}), 200
+                    return jsonify({"status": "close_failed", "bitmart": res}), 200
+
+            return jsonify({"status": "holding"}), 200
+
+        # ========== ENTREES (compat V1: VECTOR = entrée) ==========
         if event == "VECTOR":
-            if STATE["side"] == "LONG" and color in SHORT_COLORS:
-                print("EXIT LONG (VECTOR OPP)", STATE)
-                res = close_market(symbol, "LONG")
-                print("BITMART CLOSE:", res)
+            # Filtre squeeze: pas d'entrée si squeeze actif
+            if st.get("squeeze") is True:
+                print("ENTRY BLOCKED (SQUEEZE)", {"symbol": symbol})
+                return jsonify({"status": "blocked_squeeze"}), 200
 
-                if extract_code(res) == 1000:
-                    STATE.update({"in_position": False, "side": None, "symbol": None})
-                    return jsonify({"status": "exit"}), 200
+            inferred_side = None
+            if color in LONG_COLORS:
+                inferred_side = "LONG"
+            elif color in SHORT_COLORS:
+                inferred_side = "SHORT"
 
-                print("CLOSE FAILED - KEEPING STATE", STATE)
-                return jsonify({"status": "close_failed", "bitmart": res}), 200
+            if inferred_side is None:
+                return jsonify({"status": "ignored_vector_unknown_color"}), 200
 
-            if STATE["side"] == "SHORT" and color in LONG_COLORS:
-                print("EXIT SHORT (VECTOR OPP)", STATE)
-                res = close_market(symbol, "SHORT")
-                print("BITMART CLOSE:", res)
+            # Anti-double entrée même bougie/direction
+            bar_key = make_bar_key(symbol, tf, t, inferred_side, "VECTOR")
+            if st["last_entry_bar_key"] == bar_key:
+                return jsonify({"status": "ignored_same_bar"}), 200
 
-                if extract_code(res) == 1000:
-                    STATE.update({"in_position": False, "side": None, "symbol": None})
-                    return jsonify({"status": "exit"}), 200
-
-                print("CLOSE FAILED - KEEPING STATE", STATE)
-                return jsonify({"status": "close_failed", "bitmart": res}), 200
-
-        print("HOLDING POSITION", STATE)
-        return jsonify({"status": "holding"}), 200
-
-    # ========== ENTREES ==========
-    if event == "VECTOR":
-        inferred_side = None
-        if color in LONG_COLORS:
-            inferred_side = "LONG"
-        elif color in SHORT_COLORS:
-            inferred_side = "SHORT"
-
-        if inferred_side is None:
-            print("IGNORED VECTOR (unknown color)", color)
-            return jsonify({"status": "ignored_vector_unknown_color"}), 200
-
-        # Lock anti double entrée même bougie/direction (bleu->vert, rose/pourpre->rouge)
-        bar_key = make_bar_key(symbol, tf, t, inferred_side)
-        if STATE["last_entry_bar_key"] == bar_key:
-            print("DUPLICATE/UPDATE SAME BAR -> NO NEW ENTRY", {"bar_key": bar_key, "color": color})
-            return jsonify({"status": "ignored_same_bar"}), 200
-
-        if inferred_side == "LONG":
-            print("ENTER LONG", symbol, {"color": color, "bar_key": bar_key})
-            res_entry = open_market(symbol, "LONG")
-            print("BITMART ENTRY:", res_entry)
+            res_entry = open_market(symbol, inferred_side)
+            print("BITMART ENTRY:", {"symbol": symbol, "side": inferred_side, "res": res_entry})
 
             if extract_code(res_entry) != 1000:
-                print("ENTRY FAILED - NOT UPDATING STATE")
                 return jsonify({"status": "entry_failed", "bitmart": res_entry}), 200
 
-            STATE.update({"in_position": True, "side": "LONG", "symbol": symbol, "last_entry_bar_key": bar_key})
+            st.update({
+                "in_position": True,
+                "side": inferred_side,
+                "pos_size": get_size(symbol),
+                "last_entry_bar_key": bar_key
+            })
 
-            sl = float(data.get("low", 0) or 0)
-            if sl > 0:
-                res_sl = set_stop_loss(symbol, "LONG", sl)
-                print("BITMART SL:", res_sl)
-                if extract_code(res_sl) != 1000:
-                    print("SL FAILED (position kept)")
+            # SL (compat V1)
+            if inferred_side == "LONG":
+                sl = safe_float(data.get("low"), 0.0)
+                if sl > 0:
+                    res_sl = set_stop_loss(symbol, "LONG", sl, size=st["pos_size"])
+                    print("BITMART SL:", res_sl)
 
-            return jsonify({"status": "enter_long"}), 200
+            if inferred_side == "SHORT":
+                sl = safe_float(data.get("high"), 0.0)
+                if sl > 0:
+                    res_sl = set_stop_loss(symbol, "SHORT", sl, size=st["pos_size"])
+                    print("BITMART SL:", res_sl)
 
-        if inferred_side == "SHORT":
-            print("ENTER SHORT", symbol, {"color": color, "bar_key": bar_key})
-            res_entry = open_market(symbol, "SHORT")
-            print("BITMART ENTRY:", res_entry)
+            return jsonify({"status": "entered", "symbol": symbol, "side": inferred_side}), 200
 
-            if extract_code(res_entry) != 1000:
-                print("ENTRY FAILED - NOT UPDATING STATE")
-                return jsonify({"status": "entry_failed", "bitmart": res_entry}), 200
+        # Aucun match
+        return jsonify({"status": "ignored", "event": event, "action": action}), 200
 
-            STATE.update({"in_position": True, "side": "SHORT", "symbol": symbol, "last_entry_bar_key": bar_key})
-
-            sl = float(data.get("high", 0) or 0)
-            if sl > 0:
-                res_sl = set_stop_loss(symbol, "SHORT", sl)
-                print("BITMART SL:", res_sl)
-                if extract_code(res_sl) != 1000:
-                    print("SL FAILED (position kept)")
-
-            return jsonify({"status": "enter_short"}), 200
-
-    print("IGNORED (NO RULE MATCHED) state=", STATE, "event=", event, "color=", color, "action=", action)
-    return jsonify({"status": "ignored"}), 200
 
 if __name__ == "__main__":
+    # Render fournit PORT
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
