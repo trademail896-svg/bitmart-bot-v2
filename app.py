@@ -273,7 +273,6 @@ def resync_symbol(symbol: str) -> None:
     if not ok:
         return
     if sides["LONG"] > 0 and sides["SHORT"] > 0:
-        # hedge_mode -> les deux ouverts (on le marque pour debug)
         STATE[symbol].update({"in_position": True, "side": "HEDGE"})
     elif sides["LONG"] > 0:
         STATE[symbol].update({"in_position": True, "side": "LONG"})
@@ -318,7 +317,7 @@ def open_market(symbol: str, side: str, price_hint: float, source: str) -> Dict[
     payload = {
         "symbol": symbol,
         "type": "market",
-        "side": 1 if side == "LONG" else 4,  # 1 buy open long, 4 sell open short
+        "side": 1 if side == "LONG" else 4,
         "mode": 1,
         "size": size_int
     }
@@ -334,7 +333,7 @@ def close_market(symbol: str, side: str, source: str) -> Dict[str, Any]:
     payload = {
         "symbol": symbol,
         "type": "market",
-        "side": 3 if side == "LONG" else 2,  # 3 sell close long, 2 buy close short
+        "side": 3 if side == "LONG" else 2,
         "mode": 1,
         "size": size_int
     }
@@ -350,7 +349,7 @@ def set_stop_loss(symbol: str, position_side: str, trigger_price: float, source:
     payload = {
         "symbol": symbol,
         "type": "stop_loss",
-        "side": 3 if position_side == "LONG" else 2,  # reduce side
+        "side": 3 if position_side == "LONG" else 2,
         "trigger_price": f"{trigger_price:.2f}",
         "executive_price": f"{trigger_price:.2f}",
         "price_type": 1,
@@ -426,7 +425,6 @@ def webhook():
     tf = str(data.get("tf") or "")
     t = str(data.get("time") or data.get("time_ms") or "")
 
-    # prix pour sizing
     price_hint = (
         safe_float(data.get("close")) or safe_float(data.get("open"))
         or safe_float(data.get("high")) or safe_float(data.get("low"))
@@ -451,7 +449,6 @@ def webhook():
     st = STATE[symbol]
 
     # ============= SORTIES =============
-    # 1) EMA_EXIT ferme la position du côté envoyé
     if event == "EMA_EXIT":
         ema_side = (data.get("side") or "").upper().strip()
         if ema_side not in {"LONG", "SHORT"}:
@@ -477,9 +474,7 @@ def webhook():
 
         return jsonify({"status": "ema_exit_no_position", "state": st}), 200
 
-    # 2) STOCH_EXIT ou action EXIT_LONG/EXIT_SHORT
     if event == "STOCH_EXIT" or action in {"EXIT_LONG", "EXIT_SHORT"}:
-        # convention: si tu es LONG, tu sors sur HD; si tu es SHORT, tu sors sur LD
         ok, sides, _dbg = get_open_sides(symbol)
         if not ok:
             return jsonify({"status": "bitmart_position_fetch_failed"}), 200
@@ -501,6 +496,8 @@ def webhook():
         return jsonify({"status": "stoch_exit_no_match", "reason": reason, "open": sides}), 200
 
     # 3) VECTOR opposé ferme
+    # IMPORTANT (FIX ETAPE 1): ne PAS "return" si aucune sortie vector n'est déclenchée.
+    vector_exit_triggered = False
     if event == "VECTOR":
         ok, sides, _dbg = get_open_sides(symbol)
         if not ok:
@@ -520,25 +517,22 @@ def webhook():
                 return jsonify({"status": "exit_long_on_short_vector", "color": color}), 200
             return jsonify({"status": "close_failed", "bitmart": res}), 200
 
-        return jsonify({"status": "vector_seen_no_exit", "color": color, "open": sides}), 200
+        # aucune sortie vector => on continue vers la logique d'entrée
+        vector_exit_triggered = False
 
     # ============= ENTREES =============
     bid = bar_id(symbol, tf, t)
     if st["last_entry_bar_id"] == bid:
         return jsonify({"status": "ignored_same_bar"}), 200
 
-    # bloque entrées si squeeze
     if SQUEEZE_ON:
         return jsonify({"status": "blocked_squeeze"}), 200
 
-    # IMPORTANT: empêcher hedge involontaire (pas de LONG+SHORT sur même symbole)
     ok, sides, _dbg = get_open_sides(symbol)
     if ok and (sides["LONG"] > 0 or sides["SHORT"] > 0):
-        # déjà en position sur ce symbole => pas d'entrée
         st.update({"in_position": True, "side": "LONG" if sides["LONG"] > 0 else "SHORT"})
         return jsonify({"status": "ignored_already_in_position", "open": sides}), 200
 
-    # STOCH_ENTRY : LD => LONG, HD => SHORT
     if event == "STOCH_ENTRY":
         if reason == "LD":
             res = open_market(symbol, "LONG", price_hint, source="STOCH_LD")
@@ -547,7 +541,6 @@ def webhook():
 
             st.update({"in_position": True, "side": "LONG", "last_entry_bar_id": bid})
 
-            # SL stoch: idéalement data["sl_price"] = dernier swing low
             sl_price = safe_float(data.get("sl_price")) or safe_float(data.get("low"))
             if sl_price > 0:
                 set_stop_loss(symbol, "LONG", sl_price, source="SL_STOCH_LD")
@@ -561,7 +554,6 @@ def webhook():
 
             st.update({"in_position": True, "side": "SHORT", "last_entry_bar_id": bid})
 
-            # SL stoch: idéalement data["sl_price"] = dernier swing high
             sl_price = safe_float(data.get("sl_price")) or safe_float(data.get("high"))
             if sl_price > 0:
                 set_stop_loss(symbol, "SHORT", sl_price, source="SL_STOCH_HD")
@@ -570,7 +562,7 @@ def webhook():
 
         return jsonify({"status": "ignored_stoch_reason", "reason": reason}), 200
 
-    # VECTOR ENTRY (optionnel)
+    # VECTOR ENTRY (optionnel) - maintenant atteignable grâce au FIX ETAPE 1
     if event == "VECTOR":
         inferred = None
         if color in LONG_COLORS:
@@ -586,7 +578,6 @@ def webhook():
 
         st.update({"in_position": True, "side": inferred, "last_entry_bar_id": bid})
 
-        # SL vector structurel
         if inferred == "LONG":
             sl = safe_float(data.get("low"))
             if sl > 0:
