@@ -19,7 +19,7 @@ STATE: Dict[str, Dict[str, Any]] = {
     for s in ALLOWED_SYMBOLS
 }
 
-# BIAS par symbole (VERROUILLÉ) : NONE/LONG/SHORT
+# BIAS par symbole (VERROUILLÉ)
 BIAS: Dict[str, str] = {s: "NONE" for s in ALLOWED_SYMBOLS}
 
 # ================= BITMART CONFIG =================
@@ -33,7 +33,7 @@ LEVERAGE = int(float((os.environ.get("LEVERAGE") or "25").strip()))
 
 NOTIONAL_USD_PER_TRADE = float((os.environ.get("NOTIONAL_USD_PER_TRADE") or "2500").strip())
 
-BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-qqe-exit+no-squeeze+exit-fallback-logs").strip()
+BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-qqe-exit+no-squeeze+always-close-on-exit").strip()
 
 LEVERAGE_CACHE: Dict[str, Dict[str, Any]] = {}
 LEVERAGE_CACHE_TTL = 600
@@ -253,13 +253,23 @@ def fetch_position_size(symbol: str, side: str) -> int:
     ok, rows, _raw = fetch_positions(symbol)
     if not ok:
         return 1
+
     want = "1" if side == "LONG" else "2"
+
+    # 1) match exact type
     for r in rows:
         amt = safe_int(r.get("current_amount") or 0)
         if amt == 0:
             continue
         if str(r.get("position_type") or "") == want:
             return abs(amt)
+
+    # 2) fallback: take first nonzero amount (hedge_mode / API inconsistency)
+    for r in rows:
+        amt = safe_int(r.get("current_amount") or 0)
+        if amt != 0:
+            return abs(amt)
+
     return 1
 
 def resync_symbol(symbol: str) -> None:
@@ -311,7 +321,7 @@ def open_market(symbol: str, side: str, price_hint: float, source: str) -> Dict[
     payload = {
         "symbol": symbol,
         "type": "market",
-        "side": 1 if side == "LONG" else 4,
+        "side": 1 if side == "LONG" else 4,  # 1 open long, 4 open short
         "mode": 1,
         "size": size_int
     }
@@ -327,7 +337,7 @@ def close_market(symbol: str, side: str, source: str) -> Dict[str, Any]:
     payload = {
         "symbol": symbol,
         "type": "market",
-        "side": 3 if side == "LONG" else 2,
+        "side": 3 if side == "LONG" else 2,  # 3 close long, 2 close short
         "mode": 1,
         "size": size_int
     }
@@ -424,6 +434,7 @@ def webhook():
         or safe_float(data.get("high")) or safe_float(data.get("low"))
     )
 
+    # RESET (safe)
     if event == "RESET":
         if symbol in ALLOWED_SYMBOLS:
             resync_symbol(symbol)
@@ -435,42 +446,36 @@ def webhook():
     if symbol not in ALLOWED_SYMBOLS:
         return jsonify({"status": "ignored_symbol", "symbol": symbol}), 200
 
+    # sync
     resync_symbol(symbol)
     st = STATE[symbol]
 
-    # ================= BIAS UPDATE (VERROUILLÉ) =================
+    # BIAS update stoch only
     if event == "STOCH_ENTRY":
         if reason == "LD":
             BIAS[symbol] = "LONG"
         elif reason == "HD":
             BIAS[symbol] = "SHORT"
 
-    # ============================================================
-    # ===================== EXITS (QQE + ACTION) =================
-    # ============================================================
+    # =========================
+    # EXITS (QQE / ACTION)
+    # =========================
     if action in {"EXIT_LONG", "EXIT_SHORT"} or event == "QQE_EXIT":
-        ok, sides, dbg = get_open_sides(symbol)
+        ok, sides, _dbg = get_open_sides(symbol)
         print("EXIT CHECK:", {"symbol": symbol, "event": event, "action": action, "reason": reason, "ok": ok, "sides": sides}, flush=True)
 
-        # Si BitMart position fetch fail: on tente quand même le close (fallback).
-        # Ça règle les cas où /position lag ou fail, sans bloquer l'exit.
+        # FIX: on tente TOUJOURS le close sur action EXIT_*
         if action == "EXIT_LONG":
-            if ok and sides["LONG"] <= 0:
-                return jsonify({"status": "exit_long_no_position", "open": sides, "event": event, "reason": reason}), 200
-            res = close_market(symbol, "LONG", source=f"{event or 'EXIT'}_{reason or action}_FALLBACK" if not ok else f"{event or 'EXIT'}_{reason or action}")
+            res = close_market(symbol, "LONG", source=f"{event or 'EXIT'}_{reason or action}")
             return jsonify({"status": "exit_long_sent", "event": event, "reason": reason, "bitmart": res}), 200
 
         if action == "EXIT_SHORT":
-            if ok and sides["SHORT"] <= 0:
-                return jsonify({"status": "exit_short_no_position", "open": sides, "event": event, "reason": reason}), 200
-            res = close_market(symbol, "SHORT", source=f"{event or 'EXIT'}_{reason or action}_FALLBACK" if not ok else f"{event or 'EXIT'}_{reason or action}")
+            res = close_market(symbol, "SHORT", source=f"{event or 'EXIT'}_{reason or action}")
             return jsonify({"status": "exit_short_sent", "event": event, "reason": reason, "bitmart": res}), 200
 
         return jsonify({"status": "exit_missing_action", "event": event, "reason": reason}), 200
 
-    # ============================================================
-    # ============= SORTIE STOCH_EXIT (conserve) ==================
-    # ============================================================
+    # SORTIE STOCH (si tu l'utilises encore)
     if event == "STOCH_EXIT":
         ok, sides, _dbg = get_open_sides(symbol)
         if not ok:
@@ -486,9 +491,7 @@ def webhook():
 
         return jsonify({"status": "stoch_exit_no_match", "reason": reason, "open": sides}), 200
 
-    # ============================================================
-    # ============= SORTIE VECTOR OPPOSE (conserve) ===============
-    # ============================================================
+    # VECTOR opposé ferme
     if event == "VECTOR":
         ok, sides, _dbg = get_open_sides(symbol)
         if not ok:
@@ -501,9 +504,12 @@ def webhook():
         if sides["LONG"] > 0 and color in SHORT_COLORS:
             res = close_market(symbol, "LONG", source=f"VECTOR_{color}")
             return jsonify({"status": "exit_long_on_short_vector", "color": color, "bitmart": res}), 200
-        # sinon: continuer vers entrées éventuelles
 
-    # ================= ENTREES =================
+        # sinon: continuer vers entrées
+
+    # =========================
+    # ENTRIES
+    # =========================
     bid = bar_id(symbol, tf, t)
     if st["last_entry_bar_id"] == bid:
         return jsonify({"status": "ignored_same_bar"}), 200
@@ -521,7 +527,6 @@ def webhook():
             st.update({"in_position": True, "side": "LONG", "last_entry_bar_id": bid})
 
             sl_price = safe_float(data.get("sl_price")) or safe_float(data.get("low"))
-            # garde-fou: SL doit être STRICTEMENT < prix entrée en LONG
             if sl_price > 0 and sl_price < price_hint:
                 set_stop_loss(symbol, "LONG", sl_price, source="SL_STOCH_LD")
 
@@ -534,7 +539,6 @@ def webhook():
             st.update({"in_position": True, "side": "SHORT", "last_entry_bar_id": bid})
 
             sl_price = safe_float(data.get("sl_price")) or safe_float(data.get("high"))
-            # garde-fou: SL doit être STRICTEMENT > prix entrée en SHORT
             if sl_price > 0 and sl_price > price_hint:
                 set_stop_loss(symbol, "SHORT", sl_price, source="SL_STOCH_HD")
 
