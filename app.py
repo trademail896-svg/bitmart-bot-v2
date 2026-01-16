@@ -33,7 +33,7 @@ LEVERAGE = int(float((os.environ.get("LEVERAGE") or "25").strip()))
 
 NOTIONAL_USD_PER_TRADE = float((os.environ.get("NOTIONAL_USD_PER_TRADE") or "2500").strip())
 
-BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-qqe-exit+no-squeeze+always-close-on-exit").strip()
+BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-qqe-exit+no-squeeze+conditional-close").strip()
 
 LEVERAGE_CACHE: Dict[str, Dict[str, Any]] = {}
 LEVERAGE_CACHE_TTL = 600
@@ -255,8 +255,6 @@ def fetch_position_size(symbol: str, side: str) -> int:
         return 1
 
     want = "1" if side == "LONG" else "2"
-
-    # 1) match exact type
     for r in rows:
         amt = safe_int(r.get("current_amount") or 0)
         if amt == 0:
@@ -264,7 +262,7 @@ def fetch_position_size(symbol: str, side: str) -> int:
         if str(r.get("position_type") or "") == want:
             return abs(amt)
 
-    # 2) fallback: take first nonzero amount (hedge_mode / API inconsistency)
+    # fallback
     for r in rows:
         amt = safe_int(r.get("current_amount") or 0)
         if amt != 0:
@@ -321,7 +319,7 @@ def open_market(symbol: str, side: str, price_hint: float, source: str) -> Dict[
     payload = {
         "symbol": symbol,
         "type": "market",
-        "side": 1 if side == "LONG" else 4,  # 1 open long, 4 open short
+        "side": 1 if side == "LONG" else 4,
         "mode": 1,
         "size": size_int
     }
@@ -337,7 +335,7 @@ def close_market(symbol: str, side: str, source: str) -> Dict[str, Any]:
     payload = {
         "symbol": symbol,
         "type": "market",
-        "side": 3 if side == "LONG" else 2,  # 3 close long, 2 close short
+        "side": 3 if side == "LONG" else 2,
         "mode": 1,
         "size": size_int
     }
@@ -434,7 +432,7 @@ def webhook():
         or safe_float(data.get("high")) or safe_float(data.get("low"))
     )
 
-    # RESET (safe)
+    # RESET
     if event == "RESET":
         if symbol in ALLOWED_SYMBOLS:
             resync_symbol(symbol)
@@ -464,18 +462,21 @@ def webhook():
         ok, sides, _dbg = get_open_sides(symbol)
         print("EXIT CHECK:", {"symbol": symbol, "event": event, "action": action, "reason": reason, "ok": ok, "sides": sides}, flush=True)
 
-        # FIX: on tente TOUJOURS le close sur action EXIT_*
         if action == "EXIT_LONG":
-            res = close_market(symbol, "LONG", source=f"{event or 'EXIT'}_{reason or action}")
-            return jsonify({"status": "exit_long_sent", "event": event, "reason": reason, "bitmart": res}), 200
+            if ok and sides.get("LONG", 0) > 0:
+                res = close_market(symbol, "LONG", source=f"{event or 'EXIT'}_{reason or action}")
+                return jsonify({"status": "exit_long_sent", "event": event, "reason": reason, "bitmart": res}), 200
+            return jsonify({"status": "exit_long_ignored_no_position", "event": event, "reason": reason, "open": sides}), 200
 
         if action == "EXIT_SHORT":
-            res = close_market(symbol, "SHORT", source=f"{event or 'EXIT'}_{reason or action}")
-            return jsonify({"status": "exit_short_sent", "event": event, "reason": reason, "bitmart": res}), 200
+            if ok and sides.get("SHORT", 0) > 0:
+                res = close_market(symbol, "SHORT", source=f"{event or 'EXIT'}_{reason or action}")
+                return jsonify({"status": "exit_short_sent", "event": event, "reason": reason, "bitmart": res}), 200
+            return jsonify({"status": "exit_short_ignored_no_position", "event": event, "reason": reason, "open": sides}), 200
 
         return jsonify({"status": "exit_missing_action", "event": event, "reason": reason}), 200
 
-    # SORTIE STOCH (si tu l'utilises encore)
+    # SORTIE STOCH (si encore utilisé)
     if event == "STOCH_EXIT":
         ok, sides, _dbg = get_open_sides(symbol)
         if not ok:
