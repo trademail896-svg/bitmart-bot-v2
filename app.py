@@ -20,12 +20,7 @@ STATE: Dict[str, Dict[str, Any]] = {
 }
 
 # BIAS par symbole (VERROUILLÉ) : NONE/LONG/SHORT
-# - LD => LONG
-# - HD => SHORT
-# - persiste jusqu'à l'opposé
 BIAS: Dict[str, str] = {s: "NONE" for s in ALLOWED_SYMBOLS}
-
-SQUEEZE_ON = False  # VERROUILLÉ: True = no trade, False = trade
 
 # ================= BITMART CONFIG =================
 BITMART_KEY = (os.environ.get("BITMART_API_KEY") or "").strip()
@@ -36,10 +31,9 @@ BASE_URL = (os.environ.get("BITMART_BASE_URL") or "https://demo-api-cloud-v2.bit
 OPEN_TYPE = (os.environ.get("OPEN_TYPE") or "isolated").strip().lower()
 LEVERAGE = int(float((os.environ.get("LEVERAGE") or "25").strip()))
 
-# 100$ marge @25x => notional 2500$
 NOTIONAL_USD_PER_TRADE = float((os.environ.get("NOTIONAL_USD_PER_TRADE") or "2500").strip())
 
-BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-per-symbol-exits-and-sl+bias-v3.2+qqe-exit").strip()
+BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-qqe-exit+no-squeeze+exit-fallback-logs").strip()
 
 LEVERAGE_CACHE: Dict[str, Dict[str, Any]] = {}
 LEVERAGE_CACHE_TTL = 600
@@ -63,7 +57,6 @@ def normalize_symbol(s: str) -> str:
 
 def normalize_color(c: str) -> str:
     c = (c or "").strip().lower()
-    # On normalise vers les 4 couleurs VERROUILLÉES: green/blue/red/purple
     mapping = {
         "lime": "green",
         "aqua": "blue",
@@ -96,16 +89,6 @@ def safe_int(v) -> int:
 def extract_code(res: Dict[str, Any]):
     j = res.get("json") or {}
     return j.get("code")
-
-def parse_bool(v) -> bool:
-    if isinstance(v, bool):
-        return v
-    if v is None:
-        return False
-    if isinstance(v, (int, float)):
-        return v != 0
-    s = str(v).strip().lower()
-    return s in {"true", "1", "yes", "y", "on"}
 
 def bar_id(symbol: str, tf: str, t: str) -> str:
     return f"{symbol}|{tf or ''}|{t or ''}"
@@ -328,7 +311,7 @@ def open_market(symbol: str, side: str, price_hint: float, source: str) -> Dict[
     payload = {
         "symbol": symbol,
         "type": "market",
-        "side": 1 if side == "LONG" else 4,  # 1 buy open long, 4 sell open short
+        "side": 1 if side == "LONG" else 4,
         "mode": 1,
         "size": size_int
     }
@@ -344,7 +327,7 @@ def close_market(symbol: str, side: str, source: str) -> Dict[str, Any]:
     payload = {
         "symbol": symbol,
         "type": "market",
-        "side": 3 if side == "LONG" else 2,  # 3 sell close long, 2 buy close short
+        "side": 3 if side == "LONG" else 2,
         "mode": 1,
         "size": size_int
     }
@@ -360,7 +343,7 @@ def set_stop_loss(symbol: str, position_side: str, trigger_price: float, source:
     payload = {
         "symbol": symbol,
         "type": "stop_loss",
-        "side": 3 if position_side == "LONG" else 2,  # reduce side
+        "side": 3 if position_side == "LONG" else 2,
         "trigger_price": f"{trigger_price:.2f}",
         "executive_price": f"{trigger_price:.2f}",
         "price_type": 1,
@@ -390,7 +373,6 @@ def version():
         "notional_usd_per_trade": NOTIONAL_USD_PER_TRADE,
         "est_margin_usd_per_trade": NOTIONAL_USD_PER_TRADE / float(LEVERAGE),
         "secret_len": len(SECRET),
-        "squeeze_on": SQUEEZE_ON,
         "bias": BIAS
     }), 200
 
@@ -411,13 +393,13 @@ def debug_last_order():
 
 @app.get("/debug/state")
 def debug_state():
-    return jsonify({"squeeze_on": SQUEEZE_ON, "bias": BIAS, "state": STATE}), 200
+    return jsonify({"bias": BIAS, "state": STATE}), 200
 
 
 # ================= WEBHOOK =================
 @app.post("/webhook")
 def webhook():
-    global SQUEEZE_ON, LAST_ALERT, LAST_ALERT_TS
+    global LAST_ALERT, LAST_ALERT_TS
 
     data = request.get_json(silent=True) or {}
     if data.get("secret") != SECRET:
@@ -435,39 +417,28 @@ def webhook():
     color = normalize_color(data.get("color") or "")
 
     tf = str(data.get("tf") or "")
-    # on accepte time ou time_ms, string ou int
     t = str(data.get("time") or data.get("time_ms") or "")
 
-    # prix pour sizing
     price_hint = (
         safe_float(data.get("close")) or safe_float(data.get("open"))
         or safe_float(data.get("high")) or safe_float(data.get("low"))
     )
 
-    # ================= SQUEEZE =================
-    if event == "SQUEEZE":
-        # VERROUILLÉ: on=True => no trade, on=False => trade
-        SQUEEZE_ON = parse_bool(data.get("on"))
-        return jsonify({"status": "squeeze_set", "on": SQUEEZE_ON}), 200
-
-    # ================= RESET =================
     if event == "RESET":
         if symbol in ALLOWED_SYMBOLS:
             resync_symbol(symbol)
             STATE[symbol]["last_entry_bar_id"] = None
-            BIAS[symbol] = "NONE"  # VERROUILLÉ: RESET remet le bias à NONE
+            BIAS[symbol] = "NONE"
             return jsonify({"status": "state_resynced", "symbol": symbol, "state": STATE[symbol], "bias": BIAS[symbol]}), 200
         return jsonify({"status": "reset_ignored"}), 200
 
     if symbol not in ALLOWED_SYMBOLS:
         return jsonify({"status": "ignored_symbol", "symbol": symbol}), 200
 
-    # sync BitMart
     resync_symbol(symbol)
     st = STATE[symbol]
 
     # ================= BIAS UPDATE (VERROUILLÉ) =================
-    # Le bias est mis à jour UNIQUEMENT sur STOCH_ENTRY LD/HD, même si on ne peut pas entrer.
     if event == "STOCH_ENTRY":
         if reason == "LD":
             BIAS[symbol] = "LONG"
@@ -475,45 +446,31 @@ def webhook():
             BIAS[symbol] = "SHORT"
 
     # ============================================================
-    # ============= SORTIES GENERIQUES PAR ACTION (FIX) ===========
+    # ===================== EXITS (QQE + ACTION) =================
     # ============================================================
-    # IMPORTANT: EXIT_LONG / EXIT_SHORT ferment TOUJOURS la position correspondante
-    # sans dépendre du reason (donc QQE_CROSS_UP/DOWN fonctionne).
-    if action in {"EXIT_LONG", "EXIT_SHORT"} or event in {"QQE_EXIT"}:
-        ok, sides, _dbg = get_open_sides(symbol)
-        if not ok:
-            return jsonify({"status": "bitmart_position_fetch_failed"}), 200
+    if action in {"EXIT_LONG", "EXIT_SHORT"} or event == "QQE_EXIT":
+        ok, sides, dbg = get_open_sides(symbol)
+        print("EXIT CHECK:", {"symbol": symbol, "event": event, "action": action, "reason": reason, "ok": ok, "sides": sides}, flush=True)
 
-        # EXIT_LONG => fermer LONG si ouvert
+        # Si BitMart position fetch fail: on tente quand même le close (fallback).
+        # Ça règle les cas où /position lag ou fail, sans bloquer l'exit.
         if action == "EXIT_LONG":
-            if sides["LONG"] > 0:
-                res = close_market(symbol, "LONG", source=f"{event or 'EXIT'}_{reason or action}")
-                if extract_code(res) == 1000:
-                    resync_symbol(symbol)
-                    return jsonify({"status": "exit_long", "event": event, "reason": reason}), 200
-                return jsonify({"status": "close_failed", "bitmart": res}), 200
-            return jsonify({"status": "exit_long_no_position", "open": sides, "event": event, "reason": reason}), 200
+            if ok and sides["LONG"] <= 0:
+                return jsonify({"status": "exit_long_no_position", "open": sides, "event": event, "reason": reason}), 200
+            res = close_market(symbol, "LONG", source=f"{event or 'EXIT'}_{reason or action}_FALLBACK" if not ok else f"{event or 'EXIT'}_{reason or action}")
+            return jsonify({"status": "exit_long_sent", "event": event, "reason": reason, "bitmart": res}), 200
 
-        # EXIT_SHORT => fermer SHORT si ouvert
         if action == "EXIT_SHORT":
-            if sides["SHORT"] > 0:
-                res = close_market(symbol, "SHORT", source=f"{event or 'EXIT'}_{reason or action}")
-                if extract_code(res) == 1000:
-                    resync_symbol(symbol)
-                    return jsonify({"status": "exit_short", "event": event, "reason": reason}), 200
-                return jsonify({"status": "close_failed", "bitmart": res}), 200
-            return jsonify({"status": "exit_short_no_position", "open": sides, "event": event, "reason": reason}), 200
+            if ok and sides["SHORT"] <= 0:
+                return jsonify({"status": "exit_short_no_position", "open": sides, "event": event, "reason": reason}), 200
+            res = close_market(symbol, "SHORT", source=f"{event or 'EXIT'}_{reason or action}_FALLBACK" if not ok else f"{event or 'EXIT'}_{reason or action}")
+            return jsonify({"status": "exit_short_sent", "event": event, "reason": reason, "bitmart": res}), 200
 
-        # Si event==QQE_EXIT mais action absent -> on ne suppose rien
-        if event == "QQE_EXIT" and action not in {"EXIT_LONG", "EXIT_SHORT"}:
-            return jsonify({"status": "qqe_exit_missing_action"}), 200
+        return jsonify({"status": "exit_missing_action", "event": event, "reason": reason}), 200
 
     # ============================================================
     # ============= SORTIE STOCH_EXIT (conserve) ==================
     # ============================================================
-    # STOCH_EXIT garde la convention:
-    # - si tu es LONG, tu sors sur HD
-    # - si tu es SHORT, tu sors sur LD
     if event == "STOCH_EXIT":
         ok, sides, _dbg = get_open_sides(symbol)
         if not ok:
@@ -521,17 +478,11 @@ def webhook():
 
         if sides["LONG"] > 0 and reason.startswith("HD"):
             res = close_market(symbol, "LONG", source="STOCH_EXIT_HD")
-            if extract_code(res) == 1000:
-                resync_symbol(symbol)
-                return jsonify({"status": "exit_stoch_long"}), 200
-            return jsonify({"status": "close_failed", "bitmart": res}), 200
+            return jsonify({"status": "exit_stoch_long", "bitmart": res}), 200
 
         if sides["SHORT"] > 0 and reason.startswith("LD"):
             res = close_market(symbol, "SHORT", source="STOCH_EXIT_LD")
-            if extract_code(res) == 1000:
-                resync_symbol(symbol)
-                return jsonify({"status": "exit_stoch_short"}), 200
-            return jsonify({"status": "close_failed", "bitmart": res}), 200
+            return jsonify({"status": "exit_stoch_short", "bitmart": res}), 200
 
         return jsonify({"status": "stoch_exit_no_match", "reason": reason, "open": sides}), 200
 
@@ -545,46 +496,33 @@ def webhook():
 
         if sides["SHORT"] > 0 and color in LONG_COLORS:
             res = close_market(symbol, "SHORT", source=f"VECTOR_{color}")
-            if extract_code(res) == 1000:
-                resync_symbol(symbol)
-                return jsonify({"status": "exit_short_on_long_vector", "color": color}), 200
-            return jsonify({"status": "close_failed", "bitmart": res}), 200
+            return jsonify({"status": "exit_short_on_long_vector", "color": color, "bitmart": res}), 200
 
         if sides["LONG"] > 0 and color in SHORT_COLORS:
             res = close_market(symbol, "LONG", source=f"VECTOR_{color}")
-            if extract_code(res) == 1000:
-                resync_symbol(symbol)
-                return jsonify({"status": "exit_long_on_short_vector", "color": color}), 200
-            return jsonify({"status": "close_failed", "bitmart": res}), 200
+            return jsonify({"status": "exit_long_on_short_vector", "color": color, "bitmart": res}), 200
+        # sinon: continuer vers entrées éventuelles
 
-        # pas de sortie => continuer vers entrées éventuelles plus bas
-
-    # ============= ENTREES =============
+    # ================= ENTREES =================
     bid = bar_id(symbol, tf, t)
     if st["last_entry_bar_id"] == bid:
         return jsonify({"status": "ignored_same_bar"}), 200
 
-    # bloque entrées si squeeze
-    if SQUEEZE_ON:
-        return jsonify({"status": "blocked_squeeze"}), 200
-
-    # IMPORTANT: empêcher hedge involontaire (pas de LONG+SHORT sur même symbole)
     ok, sides, _dbg = get_open_sides(symbol)
     if ok and (sides["LONG"] > 0 or sides["SHORT"] > 0):
         st.update({"in_position": True, "side": "LONG" if sides["LONG"] > 0 else "SHORT"})
         return jsonify({"status": "ignored_already_in_position", "open": sides, "bias": BIAS[symbol]}), 200
 
-    # STOCH_ENTRY : LD => LONG, HD => SHORT (entrée directe)
     if event == "STOCH_ENTRY":
         if reason == "LD":
             res = open_market(symbol, "LONG", price_hint, source="STOCH_LD")
             if extract_code(res) != 1000:
                 return jsonify({"status": "entry_failed", "bitmart": res, "bias": BIAS[symbol]}), 200
-
             st.update({"in_position": True, "side": "LONG", "last_entry_bar_id": bid})
 
             sl_price = safe_float(data.get("sl_price")) or safe_float(data.get("low"))
-            if sl_price > 0:
+            # garde-fou: SL doit être STRICTEMENT < prix entrée en LONG
+            if sl_price > 0 and sl_price < price_hint:
                 set_stop_loss(symbol, "LONG", sl_price, source="SL_STOCH_LD")
 
             return jsonify({"status": "enter_long_stoch", "bias": BIAS[symbol]}), 200
@@ -593,18 +531,17 @@ def webhook():
             res = open_market(symbol, "SHORT", price_hint, source="STOCH_HD")
             if extract_code(res) != 1000:
                 return jsonify({"status": "entry_failed", "bitmart": res, "bias": BIAS[symbol]}), 200
-
             st.update({"in_position": True, "side": "SHORT", "last_entry_bar_id": bid})
 
             sl_price = safe_float(data.get("sl_price")) or safe_float(data.get("high"))
-            if sl_price > 0:
+            # garde-fou: SL doit être STRICTEMENT > prix entrée en SHORT
+            if sl_price > 0 and sl_price > price_hint:
                 set_stop_loss(symbol, "SHORT", sl_price, source="SL_STOCH_HD")
 
             return jsonify({"status": "enter_short_stoch", "bias": BIAS[symbol]}), 200
 
         return jsonify({"status": "ignored_stoch_reason", "reason": reason, "bias": BIAS[symbol]}), 200
 
-    # VECTOR ENTRY (optionnel) - VERROUILLÉ: autorisé seulement si bias correspondant
     if event == "VECTOR":
         inferred = None
         if color in LONG_COLORS:
@@ -614,7 +551,6 @@ def webhook():
         else:
             return jsonify({"status": "ignored_vector_unknown_color", "color": color, "bias": BIAS[symbol]}), 200
 
-        # Filtre bias VERROUILLÉ
         if inferred == "LONG" and BIAS[symbol] != "LONG":
             return jsonify({"status": "ignored_vector_bias_mismatch", "wanted": "LONG", "bias": BIAS[symbol], "color": color}), 200
         if inferred == "SHORT" and BIAS[symbol] != "SHORT":
@@ -626,14 +562,13 @@ def webhook():
 
         st.update({"in_position": True, "side": inferred, "last_entry_bar_id": bid})
 
-        # SL vector structurel
         if inferred == "LONG":
             sl = safe_float(data.get("low"))
-            if sl > 0:
+            if sl > 0 and sl < price_hint:
                 set_stop_loss(symbol, "LONG", sl, source="SL_VECTOR_LONG")
         else:
             sl = safe_float(data.get("high"))
-            if sl > 0:
+            if sl > 0 and sl > price_hint:
                 set_stop_loss(symbol, "SHORT", sl, source="SL_VECTOR_SHORT")
 
         return jsonify({"status": "enter_vector", "side": inferred, "bias": BIAS[symbol]}), 200
