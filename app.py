@@ -7,20 +7,145 @@ app = Flask(__name__)
 # ================= STRATEGIE =================
 ALLOWED_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
-# Couleurs VERROUILLÉES (anglais seulement)
 LONG_COLORS = {"green", "blue"}
 SHORT_COLORS = {"red", "purple"}
 
 SECRET = (os.environ.get("TV_WEBHOOK_SECRET") or "TV_BOT_DEMO_2026_V2").strip()
 
-# 1 position par symbole (BTC/ETH/SOL simultané OK)
 STATE: Dict[str, Dict[str, Any]] = {
     s: {"in_position": False, "side": None, "last_entry_bar_id": None}
     for s in ALLOWED_SYMBOLS
 }
 
-# BIAS par symbole (VERROUILLÉ)
+# BIAS persistant via Upstash Redis
 BIAS: Dict[str, str] = {s: "NONE" for s in ALLOWED_SYMBOLS}
+
+# ================= UPSTASH REDIS (REST) =================
+# Supporte plusieurs noms d'env vars (au cas où)
+UPSTASH_REDIS_REST_URL = (
+    (os.environ.get("UPSTASH_REDIS_REST_URL") or "").strip()
+    or (os.environ.get("UPSTASH_REST_URL") or "").strip()
+)
+UPSTASH_REDIS_REST_TOKEN = (
+    (os.environ.get("UPSTASH_REDIS_REST_TOKEN") or "").strip()
+    or (os.environ.get("UPSTASH_REST_TOKEN") or "").strip()
+)
+
+UPSTASH_ENABLED = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
+UPSTASH_TIMEOUT = float((os.environ.get("UPSTASH_TIMEOUT") or "5").strip())
+
+# On évite les hits Upstash trop fréquents
+BIAS_REDIS_REFRESH_TTL = int(float((os.environ.get("BIAS_REDIS_REFRESH_TTL") or "30").strip()))
+LAST_BIAS_REDIS_FETCH_TS: Dict[str, int] = {s: 0 for s in ALLOWED_SYMBOLS}
+
+REDIS_KEY_PREFIX = (os.environ.get("REDIS_KEY_PREFIX") or "tvbotv2").strip()
+
+def redis_bias_key(symbol: str) -> str:
+    return f"{REDIS_KEY_PREFIX}:bias:{symbol}"
+
+def upstash_headers() -> Dict[str, str]:
+    return {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+
+def upstash_get(key: str) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    """
+    GET key via Upstash REST: /get/<key>
+    Réponse JSON: {"result": "..."} ou {"result": null}
+    """
+    if not UPSTASH_ENABLED:
+        return False, None, {"error": "upstash_not_configured"}
+
+    url = f"{UPSTASH_REDIS_REST_URL}/get/{key}"
+    try:
+        r = requests.get(url, headers=upstash_headers(), timeout=UPSTASH_TIMEOUT)
+        try:
+            j = r.json()
+        except Exception:
+            return False, None, {"http": r.status_code, "text": r.text}
+
+        if r.status_code != 200:
+            return False, None, {"http": r.status_code, "json": j}
+
+        val = j.get("result", None)
+        if val is None:
+            return True, None, {"http": r.status_code, "json": j}
+        return True, str(val), {"http": r.status_code, "json": j}
+    except Exception as e:
+        return False, None, {"http": 0, "error": str(e)}
+
+def upstash_set(key: str, value: str) -> Tuple[bool, Dict[str, Any]]:
+    """
+    SET key value via Upstash REST: /set/<key>/<value>
+    Réponse JSON: {"result":"OK"}
+    """
+    if not UPSTASH_ENABLED:
+        return False, {"error": "upstash_not_configured"}
+
+    # value doit être URL-safe; on encode proprement via requests (en utilisant path directement c'est ok pour LONG/SHORT/NONE)
+    url = f"{UPSTASH_REDIS_REST_URL}/set/{key}/{value}"
+    try:
+        r = requests.get(url, headers=upstash_headers(), timeout=UPSTASH_TIMEOUT)
+        try:
+            j = r.json()
+        except Exception:
+            return False, {"http": r.status_code, "text": r.text}
+
+        if r.status_code != 200:
+            return False, {"http": r.status_code, "json": j}
+
+        return True, {"http": r.status_code, "json": j}
+    except Exception as e:
+        return False, {"http": 0, "error": str(e)}
+
+def bias_set_local(symbol: str, bias: str) -> None:
+    b = (bias or "").upper().strip()
+    if b not in {"LONG", "SHORT", "NONE"}:
+        return
+    BIAS[symbol] = b
+
+def bias_save_to_redis(symbol: str) -> None:
+    if not UPSTASH_ENABLED:
+        return
+    key = redis_bias_key(symbol)
+    val = BIAS.get(symbol, "NONE")
+    ok, dbg = upstash_set(key, val)
+    print("UPSTASH SET:", {"symbol": symbol, "key": key, "val": val, "ok": ok, "dbg": dbg}, flush=True)
+
+def bias_load_from_redis(symbol: str, force: bool = False) -> None:
+    """
+    Recharge BIAS[symbol] depuis Redis.
+    - On ne spam pas Upstash : TTL par symbole.
+    - force=True ignore TTL.
+    """
+    if not UPSTASH_ENABLED:
+        return
+    now = int(time.time())
+    if not force:
+        last = int(LAST_BIAS_REDIS_FETCH_TS.get(symbol, 0))
+        if (now - last) < BIAS_REDIS_REFRESH_TTL:
+            return
+    LAST_BIAS_REDIS_FETCH_TS[symbol] = now
+
+    key = redis_bias_key(symbol)
+    ok, val, dbg = upstash_get(key)
+    print("UPSTASH GET:", {"symbol": symbol, "key": key, "ok": ok, "val": val, "dbg": dbg}, flush=True)
+
+    if ok and val is not None:
+        v = val.upper().strip()
+        if v in {"LONG", "SHORT", "NONE"}:
+            BIAS[symbol] = v
+
+def bias_warmup_all() -> None:
+    """
+    Tente de charger les BIAS au boot (best effort).
+    """
+    if not UPSTASH_ENABLED:
+        return
+    for s in ALLOWED_SYMBOLS:
+        bias_load_from_redis(s, force=True)
+
+# Warmup au démarrage
+bias_warmup_all()
+
 
 # ================= BITMART CONFIG =================
 BITMART_KEY = (os.environ.get("BITMART_API_KEY") or "").strip()
@@ -30,10 +155,12 @@ BITMART_MEMO = (os.environ.get("BITMART_API_MEMO") or "").strip()
 BASE_URL = (os.environ.get("BITMART_BASE_URL") or "https://demo-api-cloud-v2.bitmart.com").strip()
 OPEN_TYPE = (os.environ.get("OPEN_TYPE") or "isolated").strip().lower()
 LEVERAGE = int(float((os.environ.get("LEVERAGE") or "25").strip()))
-
 NOTIONAL_USD_PER_TRADE = float((os.environ.get("NOTIONAL_USD_PER_TRADE") or "2500").strip())
 
-BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-qqe-exit+no-squeeze+conditional-close").strip()
+# SL safety
+MIN_SL_PCT = float((os.environ.get("MIN_SL_PCT") or "0.0005").strip())  # 0.05%
+
+BOT_VERSION = (os.environ.get("BOT_VERSION") or "v2-qqe-exit+no-squeeze+conditional-close+sl-fix+upstash-bias").strip()
 
 LEVERAGE_CACHE: Dict[str, Dict[str, Any]] = {}
 LEVERAGE_CACHE_TTL = 600
@@ -151,7 +278,7 @@ def bm_get_public(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         return {"http": 0, "error": str(e)}
 
 
-# ================= DETAILS (contract_size + last_price) =================
+# ================= DETAILS (contract_size + last_price + precision) =================
 def get_details(symbol: str) -> Tuple[bool, Dict[str, Any]]:
     now = int(time.time())
     c = DETAILS_CACHE.get(symbol)
@@ -171,11 +298,7 @@ def get_details(symbol: str) -> Tuple[bool, Dict[str, Any]]:
     DETAILS_CACHE[symbol] = payload
     return True, payload
 
-def get_contract_size_and_price(symbol: str) -> Tuple[bool, float, float, Dict[str, Any]]:
-    ok, payload = get_details(symbol)
-    if not ok:
-        return False, 0.0, 0.0, payload
-
+def _pick_details_row(payload: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
     row = None
     for it in payload.get("symbols") or []:
         if (it.get("symbol") or "").upper() == symbol:
@@ -184,7 +307,14 @@ def get_contract_size_and_price(symbol: str) -> Tuple[bool, float, float, Dict[s
     if row is None:
         syms = payload.get("symbols") or []
         row = syms[0] if syms else None
+    return row
 
+def get_contract_size_and_price(symbol: str) -> Tuple[bool, float, float, Dict[str, Any]]:
+    ok, payload = get_details(symbol)
+    if not ok:
+        return False, 0.0, 0.0, payload
+
+    row = _pick_details_row(payload, symbol)
     if not row:
         return False, 0.0, 0.0, {"error": "details_no_row", "details": payload}
 
@@ -193,6 +323,30 @@ def get_contract_size_and_price(symbol: str) -> Tuple[bool, float, float, Dict[s
     if cs <= 0:
         return False, 0.0, 0.0, {"error": "contract_size_missing", "row": row}
     return True, cs, px, {"row": row}
+
+def get_price_precision(symbol: str) -> int:
+    ok, payload = get_details(symbol)
+    if not ok:
+        return 2
+    row = _pick_details_row(payload, symbol) or {}
+    for k in ("price_precision", "price_scale", "price_decimals", "price_decimal"):
+        v = row.get(k)
+        if v is None:
+            continue
+        try:
+            p = int(float(v))
+            if 0 <= p <= 10:
+                return p
+        except Exception:
+            pass
+    return 2
+
+def round_price(symbol: str, price: float) -> float:
+    p = get_price_precision(symbol)
+    try:
+        return float(f"{price:.{p}f}")
+    except Exception:
+        return float(price)
 
 def compute_size(symbol: str, price_hint: float) -> Tuple[bool, int, Dict[str, Any]]:
     ok, cs, px, dbg = get_contract_size_and_price(symbol)
@@ -262,13 +416,36 @@ def fetch_position_size(symbol: str, side: str) -> int:
         if str(r.get("position_type") or "") == want:
             return abs(amt)
 
-    # fallback
     for r in rows:
         amt = safe_int(r.get("current_amount") or 0)
         if amt != 0:
             return abs(amt)
 
     return 1
+
+def fetch_entry_price(symbol: str, side: str) -> float:
+    ok, rows, _raw = fetch_positions(symbol)
+    if not ok:
+        return 0.0
+    want = "1" if side == "LONG" else "2"
+    for r in rows:
+        if str(r.get("position_type") or "") != want:
+            continue
+        amt = safe_int(r.get("current_amount") or 0)
+        if amt == 0:
+            continue
+        ep = safe_float(r.get("entry_price") or r.get("open_avg_price"))
+        if ep > 0:
+            return ep
+    return 0.0
+
+def fetch_entry_price_retry(symbol: str, side: str, tries: int = 5, sleep_s: float = 0.25) -> float:
+    for _ in range(max(1, tries)):
+        ep = fetch_entry_price(symbol, side)
+        if ep > 0:
+            return ep
+        time.sleep(sleep_s)
+    return 0.0
 
 def resync_symbol(symbol: str) -> None:
     ok, sides, _dbg = get_open_sides(symbol)
@@ -352,8 +529,8 @@ def set_stop_loss(symbol: str, position_side: str, trigger_price: float, source:
         "symbol": symbol,
         "type": "stop_loss",
         "side": 3 if position_side == "LONG" else 2,
-        "trigger_price": f"{trigger_price:.2f}",
-        "executive_price": f"{trigger_price:.2f}",
+        "trigger_price": f"{trigger_price:.{get_price_precision(symbol)}f}",
+        "executive_price": f"{trigger_price:.{get_price_precision(symbol)}f}",
         "price_type": 1,
         "plan_category": 2,
         "category": "market",
@@ -363,6 +540,34 @@ def set_stop_loss(symbol: str, position_side: str, trigger_price: float, source:
     record_last_order("SET_SL", symbol, position_side, payload, res, {"source": source, "sl": trigger_price})
     print("BITMART SL:", symbol, position_side, res, flush=True)
     return res
+
+def compute_safe_sl(symbol: str, side: str, proposed_sl: float, entry_price: float) -> Tuple[bool, float, Dict[str, Any]]:
+    """
+    Retourne (ok, sl_final, debug)
+    ok=False => pas de SL envoyé
+    """
+    if proposed_sl <= 0 or entry_price <= 0:
+        return False, 0.0, {"error": "missing_prices", "proposed_sl": proposed_sl, "entry_price": entry_price}
+
+    min_dist = entry_price * float(MIN_SL_PCT)
+
+    if side == "LONG":
+        target = proposed_sl
+        if target >= entry_price or (entry_price - target) < min_dist:
+            target = entry_price - min_dist
+        target = round_price(symbol, target)
+        if target >= entry_price:
+            target = round_price(symbol, entry_price - (entry_price * 0.001))
+        return True, target, {"side": side, "entry_price": entry_price, "proposed": proposed_sl, "min_dist": min_dist, "final": target}
+
+    else:
+        target = proposed_sl
+        if target <= entry_price or (target - entry_price) < min_dist:
+            target = entry_price + min_dist
+        target = round_price(symbol, target)
+        if target <= entry_price:
+            target = round_price(symbol, entry_price + (entry_price * 0.001))
+        return True, target, {"side": side, "entry_price": entry_price, "proposed": proposed_sl, "min_dist": min_dist, "final": target}
 
 
 # ================= ROUTES =================
@@ -380,8 +585,12 @@ def version():
         "open_type": OPEN_TYPE,
         "notional_usd_per_trade": NOTIONAL_USD_PER_TRADE,
         "est_margin_usd_per_trade": NOTIONAL_USD_PER_TRADE / float(LEVERAGE),
+        "min_sl_pct": MIN_SL_PCT,
         "secret_len": len(SECRET),
-        "bias": BIAS
+        "bias": BIAS,
+        "upstash_enabled": UPSTASH_ENABLED,
+        "redis_key_prefix": REDIS_KEY_PREFIX,
+        "bias_redis_refresh_ttl_s": BIAS_REDIS_REFRESH_TTL
     }), 200
 
 @app.get("/debug/bitmart")
@@ -402,6 +611,17 @@ def debug_last_order():
 @app.get("/debug/state")
 def debug_state():
     return jsonify({"bias": BIAS, "state": STATE}), 200
+
+@app.get("/debug/redis")
+def debug_redis():
+    if not UPSTASH_ENABLED:
+        return jsonify({"status": "upstash_not_configured"}), 200
+    out = {}
+    for sym in sorted(list(ALLOWED_SYMBOLS)):
+        key = redis_bias_key(sym)
+        ok, val, dbg = upstash_get(key)
+        out[sym] = {"key": key, "ok": ok, "val": val, "dbg": dbg}
+    return jsonify({"status": "ok", "redis_bias": out}), 200
 
 
 # ================= WEBHOOK =================
@@ -432,28 +652,38 @@ def webhook():
         or safe_float(data.get("high")) or safe_float(data.get("low"))
     )
 
+    # symbol gate
+    if symbol not in ALLOWED_SYMBOLS and event != "RESET":
+        return jsonify({"status": "ignored_symbol", "symbol": symbol}), 200
+
+    # Toujours essayer de recharger le BIAS depuis Redis (best-effort)
+    # - utile après restart
+    # - ne change pas ta stratégie
+    if symbol in ALLOWED_SYMBOLS:
+        bias_load_from_redis(symbol, force=False)
+
     # RESET
     if event == "RESET":
         if symbol in ALLOWED_SYMBOLS:
             resync_symbol(symbol)
             STATE[symbol]["last_entry_bar_id"] = None
-            BIAS[symbol] = "NONE"
+            bias_set_local(symbol, "NONE")
+            bias_save_to_redis(symbol)
             return jsonify({"status": "state_resynced", "symbol": symbol, "state": STATE[symbol], "bias": BIAS[symbol]}), 200
         return jsonify({"status": "reset_ignored"}), 200
-
-    if symbol not in ALLOWED_SYMBOLS:
-        return jsonify({"status": "ignored_symbol", "symbol": symbol}), 200
 
     # sync
     resync_symbol(symbol)
     st = STATE[symbol]
 
-    # BIAS update stoch only
+    # BIAS update stoch only (fondation)
     if event == "STOCH_ENTRY":
         if reason == "LD":
-            BIAS[symbol] = "LONG"
+            bias_set_local(symbol, "LONG")
+            bias_save_to_redis(symbol)
         elif reason == "HD":
-            BIAS[symbol] = "SHORT"
+            bias_set_local(symbol, "SHORT")
+            bias_save_to_redis(symbol)
 
     # =========================
     # EXITS (QQE / ACTION)
@@ -511,7 +741,9 @@ def webhook():
     # =========================
     # ENTRIES
     # =========================
-    bid = bar_id(symbol, tf, t)
+    # Priorité au bar_key si envoyé par TradingView (plus robuste)
+    bid = (data.get("bar_key") or "").strip() or bar_id(symbol, tf, t)
+
     if st["last_entry_bar_id"] == bid:
         return jsonify({"status": "ignored_same_bar"}), 200
 
@@ -520,16 +752,23 @@ def webhook():
         st.update({"in_position": True, "side": "LONG" if sides["LONG"] > 0 else "SHORT"})
         return jsonify({"status": "ignored_already_in_position", "open": sides, "bias": BIAS[symbol]}), 200
 
+    # STOCH ENTRY (fondation)
     if event == "STOCH_ENTRY":
         if reason == "LD":
             res = open_market(symbol, "LONG", price_hint, source="STOCH_LD")
             if extract_code(res) != 1000:
                 return jsonify({"status": "entry_failed", "bitmart": res, "bias": BIAS[symbol]}), 200
+
             st.update({"in_position": True, "side": "LONG", "last_entry_bar_id": bid})
 
-            sl_price = safe_float(data.get("sl_price")) or safe_float(data.get("low"))
-            if sl_price > 0 and sl_price < price_hint:
-                set_stop_loss(symbol, "LONG", sl_price, source="SL_STOCH_LD")
+            proposed_sl = safe_float(data.get("sl_price")) or safe_float(data.get("low"))
+            entry = fetch_entry_price_retry(symbol, "LONG", tries=5, sleep_s=0.25) or price_hint
+            ok_sl, sl_final, sl_dbg = compute_safe_sl(symbol, "LONG", proposed_sl, entry)
+            if ok_sl:
+                set_stop_loss(symbol, "LONG", sl_final, source="SL_STOCH_LD_SAFE")
+                print("SL SAFE:", symbol, sl_dbg, flush=True)
+            else:
+                print("SL SKIP:", symbol, sl_dbg, flush=True)
 
             return jsonify({"status": "enter_long_stoch", "bias": BIAS[symbol]}), 200
 
@@ -537,16 +776,23 @@ def webhook():
             res = open_market(symbol, "SHORT", price_hint, source="STOCH_HD")
             if extract_code(res) != 1000:
                 return jsonify({"status": "entry_failed", "bitmart": res, "bias": BIAS[symbol]}), 200
+
             st.update({"in_position": True, "side": "SHORT", "last_entry_bar_id": bid})
 
-            sl_price = safe_float(data.get("sl_price")) or safe_float(data.get("high"))
-            if sl_price > 0 and sl_price > price_hint:
-                set_stop_loss(symbol, "SHORT", sl_price, source="SL_STOCH_HD")
+            proposed_sl = safe_float(data.get("sl_price")) or safe_float(data.get("high"))
+            entry = fetch_entry_price_retry(symbol, "SHORT", tries=5, sleep_s=0.25) or price_hint
+            ok_sl, sl_final, sl_dbg = compute_safe_sl(symbol, "SHORT", proposed_sl, entry)
+            if ok_sl:
+                set_stop_loss(symbol, "SHORT", sl_final, source="SL_STOCH_HD_SAFE")
+                print("SL SAFE:", symbol, sl_dbg, flush=True)
+            else:
+                print("SL SKIP:", symbol, sl_dbg, flush=True)
 
             return jsonify({"status": "enter_short_stoch", "bias": BIAS[symbol]}), 200
 
         return jsonify({"status": "ignored_stoch_reason", "reason": reason, "bias": BIAS[symbol]}), 200
 
+    # VECTOR ENTRY (conditionné par le BIAS: LD ON / HD ON)
     if event == "VECTOR":
         inferred = None
         if color in LONG_COLORS:
@@ -568,13 +814,19 @@ def webhook():
         st.update({"in_position": True, "side": inferred, "last_entry_bar_id": bid})
 
         if inferred == "LONG":
-            sl = safe_float(data.get("low"))
-            if sl > 0 and sl < price_hint:
-                set_stop_loss(symbol, "LONG", sl, source="SL_VECTOR_LONG")
+            proposed_sl = safe_float(data.get("low"))
+            entry = fetch_entry_price_retry(symbol, "LONG", tries=5, sleep_s=0.25) or price_hint
+            ok_sl, sl_final, sl_dbg = compute_safe_sl(symbol, "LONG", proposed_sl, entry)
+            if ok_sl:
+                set_stop_loss(symbol, "LONG", sl_final, source="SL_VECTOR_LONG_SAFE")
+                print("SL SAFE:", symbol, sl_dbg, flush=True)
         else:
-            sl = safe_float(data.get("high"))
-            if sl > 0 and sl > price_hint:
-                set_stop_loss(symbol, "SHORT", sl, source="SL_VECTOR_SHORT")
+            proposed_sl = safe_float(data.get("high"))
+            entry = fetch_entry_price_retry(symbol, "SHORT", tries=5, sleep_s=0.25) or price_hint
+            ok_sl, sl_final, sl_dbg = compute_safe_sl(symbol, "SHORT", proposed_sl, entry)
+            if ok_sl:
+                set_stop_loss(symbol, "SHORT", sl_final, source="SL_VECTOR_SHORT_SAFE")
+                print("SL SAFE:", symbol, sl_dbg, flush=True)
 
         return jsonify({"status": "enter_vector", "side": inferred, "bias": BIAS[symbol]}), 200
 
