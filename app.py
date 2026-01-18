@@ -48,6 +48,10 @@ UPSTASH_REDIS_REST_URL = (os.environ.get("UPSTASH_REDIS_REST_URL") or "").strip(
 UPSTASH_REDIS_REST_TOKEN = (os.environ.get("UPSTASH_REDIS_REST_TOKEN") or "").strip()
 UPSTASH_PREFIX = (os.environ.get("UPSTASH_PREFIX") or "tvbotv2").strip()
 
+# (BUFFER/REPLAY) minimal robustness for out-of-order alerts
+PENDING_TTL_SEC = float(os.environ.get("BOT_PENDING_TTL_SEC") or "90")   # keep small: ~ up to 3x 5m bars is NOT needed; 90s is enough for order jitter
+PENDING_MAX_PER_SYMBOL = int(os.environ.get("BOT_PENDING_MAX_PER_SYMBOL") or "3")  # minimal queue size
+
 # =========================
 # STATE (per symbol)
 # =========================
@@ -73,6 +77,10 @@ STATE: Dict[str, Dict[str, Any]] = {
         "pending_entry_bar_key": None,
         "pending_entry_first_ts": None,
         "pending_entry_color": None,  # "GREEN"/"RED"
+
+        # (BUFFER/REPLAY) pending signals keyed by bar_key (per symbol)
+        # { "<bar_key>": {"event": "VECTOR"/"STOCH_SIGNAL", "payload": {...minimal...}, "ts": <epoch>} }
+        "pending_by_bar_key": {},
     }
     for s in ALLOWED_SYMBOLS
 }
@@ -130,6 +138,95 @@ def bar_key_from_payload(p: Dict[str, Any]) -> Optional[str]:
     if isinstance(bk, str) and bk.strip():
         return bk.strip()
     return None
+
+def _pending_cleanup(s: Dict[str, Any]) -> None:
+    pbk = s.get("pending_by_bar_key")
+    if not isinstance(pbk, dict) or not pbk:
+        return
+    cutoff = now_ts() - float(PENDING_TTL_SEC)
+    stale = []
+    for k, v in pbk.items():
+        ts = None
+        if isinstance(v, dict):
+            ts = safe_float(v.get("ts"))
+        if ts is None or ts < cutoff:
+            stale.append(k)
+    for k in stale:
+        try:
+            del pbk[k]
+        except Exception:
+            pass
+
+def _pending_put(s: Dict[str, Any], bk: str, event: str, payload_min: Dict[str, Any]) -> None:
+    if not bk:
+        return
+    pbk = s.get("pending_by_bar_key")
+    if not isinstance(pbk, dict):
+        pbk = {}
+        s["pending_by_bar_key"] = pbk
+
+    _pending_cleanup(s)
+
+    # enforce max size (drop oldest)
+    if len(pbk) >= int(PENDING_MAX_PER_SYMBOL):
+        # drop oldest by ts
+        oldest_k = None
+        oldest_ts = None
+        for k, v in pbk.items():
+            ts = None
+            if isinstance(v, dict):
+                ts = safe_float(v.get("ts"))
+            if ts is None:
+                ts = 0.0
+            if oldest_ts is None or ts < oldest_ts:
+                oldest_ts = ts
+                oldest_k = k
+        if oldest_k is not None:
+            try:
+                del pbk[oldest_k]
+            except Exception:
+                pass
+
+    pbk[bk] = {"event": event, "payload": payload_min, "ts": now_ts()}
+    print(f"PENDING STORED: bar_key={bk} event={event} pending_count={len(pbk)}")
+
+def _pending_get(s: Dict[str, Any], bk: str) -> Optional[Dict[str, Any]]:
+    pbk = s.get("pending_by_bar_key")
+    if not isinstance(pbk, dict) or not bk:
+        return None
+    _pending_cleanup(s)
+    v = pbk.get(bk)
+    if isinstance(v, dict):
+        return v
+    return None
+
+def _pending_del(s: Dict[str, Any], bk: str) -> None:
+    pbk = s.get("pending_by_bar_key")
+    if isinstance(pbk, dict) and bk in pbk:
+        try:
+            del pbk[bk]
+        except Exception:
+            pass
+
+def _min_payload_for_pending(payload: Dict[str, Any], event: str) -> Dict[str, Any]:
+    """
+    Store only minimal fields needed for later decision + SL price.
+    """
+    p: Dict[str, Any] = {
+        "event": event,
+        "ticker": payload.get("ticker"),
+        "tf": payload.get("tf"),
+        "time": payload.get("time"),
+        "bar_key": payload.get("bar_key"),
+        "open": payload.get("open"),
+        "close": payload.get("close"),
+    }
+    if event == "VECTOR":
+        p["color"] = payload.get("color")
+        p["side"] = payload.get("side")
+    elif event == "STOCH_SIGNAL":
+        p["signal"] = payload.get("signal")
+    return p
 
 # =========================
 # BITMART SIGNING / REQUESTS
@@ -465,111 +562,144 @@ def webhook():
 
     upstash_get_bias(symbol)
 
-    # EMA50_STATE updates regime only
+    def _handle_non_ema_event(inner_payload: Dict[str, Any], from_replay: bool = False) -> Tuple[Dict[str, Any], int]:
+        """
+        Runs the exact same decision/execution path for non-EMA50_STATE events.
+        from_replay=True prevents re-buffering loops.
+        """
+        inner_event = (inner_payload.get("event") or "").strip().upper()
+        inner_bk = bar_key_from_payload(inner_payload)
+
+        # VECTOR buffer updates
+        if inner_event == "VECTOR":
+            color = (inner_payload.get("color") or "").upper()
+            if color in (LONG_COLOR, SHORT_COLOR):
+                update_vector_buffer(s, inner_bk, color)
+
+        # Decide action: EXIT > ENTRY
+        action: Optional[str] = None
+        action = should_exit(s, inner_event, inner_payload)
+        if action is None:
+            action = should_enter(s, inner_event, inner_payload)
+
+        # If no action and regime missing: buffer/replay (only for entry triggers, not for replay calls)
+        if action is None and (not from_replay) and s.get("regime") is None and inner_event in ("VECTOR", "STOCH_SIGNAL") and inner_bk:
+            _pending_put(s, inner_bk, inner_event, _min_payload_for_pending(inner_payload, inner_event))
+            return {"ok": True, "action": "NONE", "note": "buffered_pending_regime", "bar_key": inner_bk}, 200
+
+        if action is None:
+            return {"ok": True, "action": "NONE"}, 200
+
+        # RESYNC before executing
+        resync_state_with_exchange(symbol, s)
+
+        if action in ("EXIT_LONG", "EXIT_SHORT"):
+            if not s["in_position"] or (action == "EXIT_LONG" and s["side"] != "LONG") or (action == "EXIT_SHORT" and s["side"] != "SHORT"):
+                print(f"RESYNC BLOCK EXIT: {symbol} action={action} state_in={s['in_position']} state_side={s['side']}")
+                return {"ok": True, "action": "NONE", "note": "resync_block_exit"}, 200
+
+        if action in ("ENTER_LONG", "ENTER_SHORT"):
+            if s["in_position"]:
+                print(f"RESYNC BLOCK ENTRY: {symbol} action={action} exchange/state shows in_position")
+                return {"ok": True, "action": "NONE", "note": "resync_block_entry"}, 200
+
+        # BAR_KEY GATE
+        if inner_bk and s["last_action_bar_key"] == inner_bk:
+            print(f"SKIP_DUPLICATE_BAR_KEY: {symbol} bar_key={inner_bk} incoming_event={inner_event} action={action}")
+            return {"ok": True, "skipped": "duplicate_bar_key"}, 200
+
+        # ENTRY debounce ONLY for VECTOR-triggered ENTRY
+        if inner_event == "VECTOR" and action in ("ENTER_LONG", "ENTER_SHORT"):
+            color = (inner_payload.get("color") or "").upper()
+            if color in (LONG_COLOR, SHORT_COLOR):
+                if not entry_allowed_by_vector_debounce(s, inner_bk, color):
+                    return {"ok": True, "action": "NONE", "note": "vector_entry_debounce"}, 200
+
+            final_color = s.get("pending_entry_color")
+            if action == "ENTER_LONG" and final_color != LONG_COLOR:
+                print(f"VECTOR ENTRY CANCEL: {symbol} bar_key={inner_bk} action={action} final_color={final_color}")
+                return {"ok": True, "action": "NONE", "note": "vector_entry_color_flip"}, 200
+            if action == "ENTER_SHORT" and final_color != SHORT_COLOR:
+                print(f"VECTOR ENTRY CANCEL: {symbol} bar_key={inner_bk} action={action} final_color={final_color}")
+                return {"ok": True, "action": "NONE", "note": "vector_entry_color_flip"}, 200
+
+        # Execute action
+        if action == "ENTER_LONG":
+            bitmart_set_leverage(symbol)
+            r = bitmart_open_market(symbol, "LONG")
+
+            s["in_position"] = True
+            s["side"] = "LONG"
+            s["last_entry_bar_key"] = inner_bk
+
+            entry_px = safe_float(inner_payload.get("close")) or safe_float(inner_payload.get("open")) or 0.0
+            if entry_px > 0:
+                bitmart_set_sl(symbol, "LONG", entry_px)
+
+            s["last_action_bar_key"] = inner_bk
+            s["last_action_type"] = "ENTRY"
+            return {"ok": True, "action": "ENTER_LONG", "bitmart": r}, 200
+
+        if action == "ENTER_SHORT":
+            bitmart_set_leverage(symbol)
+            r = bitmart_open_market(symbol, "SHORT")
+
+            s["in_position"] = True
+            s["side"] = "SHORT"
+            s["last_entry_bar_key"] = inner_bk
+
+            entry_px = safe_float(inner_payload.get("close")) or safe_float(inner_payload.get("open")) or 0.0
+            if entry_px > 0:
+                bitmart_set_sl(symbol, "SHORT", entry_px)
+
+            s["last_action_bar_key"] = inner_bk
+            s["last_action_type"] = "ENTRY"
+            return {"ok": True, "action": "ENTER_SHORT", "bitmart": r}, 200
+
+        if action == "EXIT_LONG":
+            r = bitmart_close_market(symbol, "LONG")
+            s["in_position"] = False
+            s["side"] = None
+            s["last_action_bar_key"] = inner_bk
+            s["last_action_type"] = "EXIT"
+            return {"ok": True, "action": "EXIT_LONG", "bitmart": r}, 200
+
+        if action == "EXIT_SHORT":
+            r = bitmart_close_market(symbol, "SHORT")
+            s["in_position"] = False
+            s["side"] = None
+            s["last_action_bar_key"] = inner_bk
+            s["last_action_type"] = "EXIT"
+            return {"ok": True, "action": "EXIT_SHORT", "bitmart": r}, 200
+
+        return {"ok": True, "action": "NONE"}, 200
+
+    # EMA50_STATE updates regime only + (BUFFER/REPLAY) optional replay of same bar_key
     if event == "EMA50_STATE":
         st = (payload.get("state") or "").upper()
         if st in ("ABOVE", "BELOW"):
             s["regime"] = st
+
+        # Try replay for SAME bar_key (safe)
+        if bk:
+            pending = _pending_get(s, bk)
+            if pending and isinstance(pending.get("payload"), dict):
+                replay_payload = dict(pending["payload"])
+                _pending_del(s, bk)
+                print(f"REPLAY TRIGGER: symbol={symbol} bar_key={bk} event={pending.get('event')}")
+                replay_js, replay_code = _handle_non_ema_event(replay_payload, from_replay=True)
+                return jsonify({
+                    "ok": True,
+                    "event": "EMA50_STATE",
+                    "regime": s["regime"],
+                    "replay": replay_js,
+                }), 200
+
         return jsonify({"ok": True, "event": "EMA50_STATE", "regime": s["regime"]}), 200
 
-    # VECTOR buffer updates
-    if event == "VECTOR":
-        color = (payload.get("color") or "").upper()
-        if color in (LONG_COLOR, SHORT_COLOR):
-            update_vector_buffer(s, bk, color)
-
-    # Decide action: EXIT > ENTRY
-    action: Optional[str] = None
-    action = should_exit(s, event, payload)
-    if action is None:
-        action = should_enter(s, event, payload)
-
-    if action is None:
-        return jsonify({"ok": True, "action": "NONE"}), 200
-
-    # RESYNC before executing
-    resync_state_with_exchange(symbol, s)
-
-    if action in ("EXIT_LONG", "EXIT_SHORT"):
-        if not s["in_position"] or (action == "EXIT_LONG" and s["side"] != "LONG") or (action == "EXIT_SHORT" and s["side"] != "SHORT"):
-            print(f"RESYNC BLOCK EXIT: {symbol} action={action} state_in={s['in_position']} state_side={s['side']}")
-            return jsonify({"ok": True, "action": "NONE", "note": "resync_block_exit"}), 200
-
-    if action in ("ENTER_LONG", "ENTER_SHORT"):
-        if s["in_position"]:
-            print(f"RESYNC BLOCK ENTRY: {symbol} action={action} exchange/state shows in_position")
-            return jsonify({"ok": True, "action": "NONE", "note": "resync_block_entry"}), 200
-
-    # BAR_KEY GATE
-    if bk and s["last_action_bar_key"] == bk:
-        print(f"SKIP_DUPLICATE_BAR_KEY: {symbol} bar_key={bk} incoming_event={event} action={action}")
-        return jsonify({"ok": True, "skipped": "duplicate_bar_key"}), 200
-
-    # ENTRY debounce ONLY for VECTOR-triggered ENTRY
-    if event == "VECTOR" and action in ("ENTER_LONG", "ENTER_SHORT"):
-        color = (payload.get("color") or "").upper()
-        if color in (LONG_COLOR, SHORT_COLOR):
-            if not entry_allowed_by_vector_debounce(s, bk, color):
-                return jsonify({"ok": True, "action": "NONE", "note": "vector_entry_debounce"}), 200
-
-        final_color = s.get("pending_entry_color")
-        if action == "ENTER_LONG" and final_color != LONG_COLOR:
-            print(f"VECTOR ENTRY CANCEL: {symbol} bar_key={bk} action={action} final_color={final_color}")
-            return jsonify({"ok": True, "action": "NONE", "note": "vector_entry_color_flip"}), 200
-        if action == "ENTER_SHORT" and final_color != SHORT_COLOR:
-            print(f"VECTOR ENTRY CANCEL: {symbol} bar_key={bk} action={action} final_color={final_color}")
-            return jsonify({"ok": True, "action": "NONE", "note": "vector_entry_color_flip"}), 200
-
-    # Execute action
-    if action == "ENTER_LONG":
-        bitmart_set_leverage(symbol)
-        r = bitmart_open_market(symbol, "LONG")
-
-        s["in_position"] = True
-        s["side"] = "LONG"
-        s["last_entry_bar_key"] = bk
-
-        entry_px = safe_float(payload.get("close")) or safe_float(payload.get("open")) or 0.0
-        if entry_px > 0:
-            bitmart_set_sl(symbol, "LONG", entry_px)
-
-        s["last_action_bar_key"] = bk
-        s["last_action_type"] = "ENTRY"
-        return jsonify({"ok": True, "action": "ENTER_LONG", "bitmart": r}), 200
-
-    if action == "ENTER_SHORT":
-        bitmart_set_leverage(symbol)
-        r = bitmart_open_market(symbol, "SHORT")
-
-        s["in_position"] = True
-        s["side"] = "SHORT"
-        s["last_entry_bar_key"] = bk
-
-        entry_px = safe_float(payload.get("close")) or safe_float(payload.get("open")) or 0.0
-        if entry_px > 0:
-            bitmart_set_sl(symbol, "SHORT", entry_px)
-
-        s["last_action_bar_key"] = bk
-        s["last_action_type"] = "ENTRY"
-        return jsonify({"ok": True, "action": "ENTER_SHORT", "bitmart": r}), 200
-
-    if action == "EXIT_LONG":
-        r = bitmart_close_market(symbol, "LONG")
-        s["in_position"] = False
-        s["side"] = None
-        s["last_action_bar_key"] = bk
-        s["last_action_type"] = "EXIT"
-        return jsonify({"ok": True, "action": "EXIT_LONG", "bitmart": r}), 200
-
-    if action == "EXIT_SHORT":
-        r = bitmart_close_market(symbol, "SHORT")
-        s["in_position"] = False
-        s["side"] = None
-        s["last_action_bar_key"] = bk
-        s["last_action_type"] = "EXIT"
-        return jsonify({"ok": True, "action": "EXIT_SHORT", "bitmart": r}), 200
-
-    return jsonify({"ok": True, "action": "NONE"}), 200
+    # All other events go through the normal path (with buffering if regime missing)
+    js, code = _handle_non_ema_event(payload, from_replay=False)
+    return jsonify(js), code
 
 # =========================
 # HEALTH
@@ -583,6 +713,8 @@ def health():
         "open_type": OPEN_TYPE,
         "vector_entry_debounce_sec": VECTOR_ENTRY_DEBOUNCE_SEC,
         "resync_before_trade": RESYNC_BEFORE_TRADE,
+        "pending_ttl_sec": PENDING_TTL_SEC,
+        "pending_max_per_symbol": PENDING_MAX_PER_SYMBOL,
         "allowed_symbols": sorted(list(ALLOWED_SYMBOLS)),
         "state": {
             s: {
@@ -593,6 +725,7 @@ def health():
                 "last_action_type": STATE[s]["last_action_type"],
                 "last_vector_bar_key": STATE[s]["last_vector_bar_key"],
                 "last_vector_color": STATE[s]["last_vector_color"],
+                "pending_count": len(STATE[s].get("pending_by_bar_key") or {}),
             }
             for s in ALLOWED_SYMBOLS
         }
