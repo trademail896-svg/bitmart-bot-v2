@@ -23,7 +23,7 @@ SHORT_COLOR = "RED"
 SECRET = (os.environ.get("TV_WEBHOOK_SECRET") or "TV_BOT_DEMO_2026_V2").strip()
 
 # BitMart (Futures)
-BITMART_BASE_URL = (os.environ.get("BITMART_BASE_URL") or "").strip()  # e.g. https://api-cloud-v2.bitmart.com or demo-api-cloud-v2...
+BITMART_BASE_URL = (os.environ.get("BITMART_BASE_URL") or "").strip()  # demo/live base url
 BITMART_API_KEY = (os.environ.get("BITMART_API_KEY") or "").strip()
 BITMART_API_SECRET = (os.environ.get("BITMART_API_SECRET") or "").strip()
 BITMART_MEMO = (os.environ.get("BITMART_MEMO") or "").strip()
@@ -33,7 +33,7 @@ LEVERAGE = int(os.environ.get("BOT_LEVERAGE") or "25")
 OPEN_TYPE = (os.environ.get("BOT_OPEN_TYPE") or "isolated").strip()  # isolated/cross
 NOTIONAL_USD_PER_TRADE = float(os.environ.get("BOT_NOTIONAL_USD_PER_TRADE") or "2500.0")
 
-# SL config (UNCHANGED meaning: same % logic; implementation moved to preset SL on submit-order)
+# SL config
 SL_PCT = float(os.environ.get("BOT_SL_PCT") or "0.0025")  # 0.25% default
 
 # VECTOR entry debounce
@@ -46,6 +46,10 @@ RESYNC_BEFORE_TRADE = (os.environ.get("BOT_RESYNC_BEFORE_TRADE") or "1").strip()
 UPSTASH_REDIS_REST_URL = (os.environ.get("UPSTASH_REDIS_REST_URL") or "").strip()
 UPSTASH_REDIS_REST_TOKEN = (os.environ.get("UPSTASH_REDIS_REST_TOKEN") or "").strip()
 UPSTASH_PREFIX = (os.environ.get("UPSTASH_PREFIX") or "tvbotv2").strip()
+
+# Post-entry SL verify/fallback (NEW)
+POST_ENTRY_VERIFY_SL = (os.environ.get("BOT_POST_ENTRY_VERIFY_SL") or "1").strip() == "1"
+POST_ENTRY_VERIFY_LIMIT = int(os.environ.get("BOT_POST_ENTRY_VERIFY_LIMIT") or "10")
 
 # =========================
 # STATE (per symbol)
@@ -61,7 +65,7 @@ STATE: Dict[str, Dict[str, Any]] = {
 
         # Bar-key gate: 1 ACTION max per bar_key
         "last_action_bar_key": None,
-        "last_action_type": None,   # "ENTRY"/"EXIT"/"SL" (debug)
+        "last_action_type": None,   # "ENTRY"/"EXIT" (debug)
 
         # Vector buffer (last vector seen for a bar_key)
         "last_vector_bar_key": None,
@@ -131,17 +135,12 @@ def bar_key_from_payload(p: Dict[str, Any]) -> Optional[str]:
     return None
 
 def _mk_client_order_id(symbol: str) -> str:
-    # short deterministic-ish id (<=32 chars)
     return f"TVBOT_{symbol}_{int(time.time()*1000)}"[:32]
 
 # =========================
 # BITMART SIGNING / REQUESTS
 # =========================
 def _bitmart_sign(ts_ms: str, memo: str, body_str: str) -> str:
-    """
-    BitMart Futures signature:
-      sign = HMAC_SHA256(secret, ts + "#" + memo + "#" + body)
-    """
     payload = f"{ts_ms}#{memo}#{body_str}"
     return hmac.new(BITMART_API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -194,14 +193,13 @@ def bitmart_set_leverage(symbol: str) -> Dict[str, Any]:
     return {"http": http, "json": js}
 
 def _calc_size_from_notional(symbol: str) -> int:
-    # Placeholder sizing; MUST be int for BitMart (size Int)
-    # You can replace later with real sizing logic.
+    # Placeholder sizing (must be int)
     return 1
 
 def _calc_sl_price(side: str, ref_price: float) -> Optional[str]:
     """
-    Returns SL price as string for preset_stop_loss_price.
-    Uses same % logic + safe min distance + rounding you had.
+    Returns SL price as string.
+    Same % logic + safe min distance + rounding as before.
     """
     if ref_price <= 0:
         return None
@@ -221,31 +219,29 @@ def _calc_sl_price(side: str, ref_price: float) -> Optional[str]:
 
 def bitmart_open_market(symbol: str, side: str, sl_price: Optional[str]) -> Dict[str, Any]:
     """
-    Uses /contract/private/submit-order with:
-      type=market
-      side int (oneway mode):
-        1=buy (open long)
-        4=sell (open short)
-      size must be INT
-    Preset SL via preset_stop_loss_price (optional).
+    submit-order:
+      side int (one-way):
+        1=open long (buy)
+        4=open short (sell)
+      size must be int
+    preset SL included if provided.
     """
     path = "/contract/private/submit-order"
 
     side_int = 1 if side == "LONG" else 4
-    size_int = int(_calc_size_from_notional(symbol))  # MUST be int
+    size_int = int(_calc_size_from_notional(symbol))
 
     body: Dict[str, Any] = {
         "symbol": symbol,
         "client_order_id": _mk_client_order_id(symbol),
         "type": "market",
         "side": side_int,
-        "mode": 1,  # GTC (default) - explicitly set
+        "mode": 1,
         "leverage": str(LEVERAGE),
         "open_type": OPEN_TYPE,
         "size": size_int,
     }
 
-    # preset SL (supported by submit-order)
     if sl_price:
         body["preset_stop_loss_price"] = sl_price
         body["preset_stop_loss_price_type"] = 1  # last_price
@@ -256,16 +252,15 @@ def bitmart_open_market(symbol: str, side: str, sl_price: Optional[str]) -> Dict
 
 def bitmart_close_market(symbol: str, side: str) -> Dict[str, Any]:
     """
-    NOTE: close requires correct size. For now, keep existing behavior minimal.
-    If you want perfect close sizing, we can wire it to position amount next.
+    Minimal close. If you want perfect close sizing later, we can query position size.
     """
     path = "/contract/private/submit-order"
 
-    # one-way mode close sides:
-    # 2=buy(reduce only) -> close short
-    # 3=sell(reduce only) -> close long
+    # one-way close:
+    # 3 = sell reduce-only -> close long
+    # 2 = buy reduce-only  -> close short
     side_int = 3 if side == "LONG" else 2
-    size_int = 1  # minimal placeholder
+    size_int = 1
 
     body: Dict[str, Any] = {
         "symbol": symbol,
@@ -283,7 +278,95 @@ def bitmart_close_market(symbol: str, side: str) -> Dict[str, Any]:
     return {"http": http, "json": js, "body": body}
 
 # =========================
-# (3) RESYNC HELPERS
+# POST-ENTRY SL VERIFY / FALLBACK (NEW)
+# =========================
+def bitmart_get_profit_loss_plans(symbol: str, limit: int = 10) -> Dict[str, Any]:
+    # plan_type=profit_loss is key for preset TP/SL plans
+    path = f"/contract/private/current-plan-order?symbol={symbol}&plan_type=profit_loss&limit={int(limit)}"
+    http, js = bitmart_request("GET", path, None)
+    print(f"BITMART GET PLANS: {symbol} {{'http': {http}, 'json': {js}}}")
+    return {"http": http, "json": js}
+
+def bitmart_modify_preset_plan(symbol: str, order_id: Any, sl_price: str) -> Dict[str, Any]:
+    """
+    Force-attach preset SL to an existing order via modify-preset-plan-order.
+    """
+    path = "/contract/private/modify-preset-plan-order"
+    body = {
+        "symbol": symbol,
+        "order_id": str(order_id),
+        "open_type": OPEN_TYPE,
+        "preset_stop_loss_price": str(sl_price),
+        "preset_stop_loss_price_type": 1,  # last_price
+    }
+    http, js = bitmart_request("POST", path, body)
+    print(f"BITMART MODIFY PRESET SL: {symbol} {{'http': {http}, 'json': {js}}} body={body}")
+    return {"http": http, "json": js, "body": body}
+
+def _extract_plan_list(js: dict) -> List[dict]:
+    data = js.get("data")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        # common patterns
+        for k in ("result", "orders", "plan_orders", "plan_order", "records"):
+            v = data.get(k)
+            if isinstance(v, list):
+                return v
+        # if dict represents a single plan
+        if "order_id" in data or "plan_order_id" in data:
+            return [data]
+    return []
+
+def _plan_matches(plan: dict, order_id: str, sl_price: str) -> bool:
+    """
+    Try multiple fields because BitMart schemas vary slightly.
+    """
+    if not isinstance(plan, dict):
+        return False
+
+    oid = str(plan.get("order_id") or plan.get("entrust_id") or plan.get("plan_order_id") or plan.get("trigger_order_id") or "")
+    if oid and oid == str(order_id):
+        return True
+
+    # try match by trigger/stop price
+    trig = str(plan.get("trigger_price") or plan.get("triggerPrice") or plan.get("stop_loss_price") or plan.get("stopLossPrice") or "")
+    if trig and sl_price and trig == str(sl_price):
+        return True
+
+    return False
+
+def ensure_sl_present(symbol: str, order_id: Any, sl_price: Optional[str]) -> None:
+    if not POST_ENTRY_VERIFY_SL:
+        return
+    if not order_id or not sl_price:
+        return
+
+    try:
+        check = bitmart_get_profit_loss_plans(symbol, limit=POST_ENTRY_VERIFY_LIMIT)
+        http = int(check.get("http") or 0)
+        js = check.get("json") if isinstance(check.get("json"), dict) else {}
+
+        found = False
+        if http == 200 and isinstance(js, dict) and js.get("code") in (1000, "1000"):
+            plans = _extract_plan_list(js)
+            for p in plans:
+                if _plan_matches(p, str(order_id), str(sl_price)):
+                    found = True
+                    break
+
+        if found:
+            print(f"SL VERIFY OK: {symbol} order_id={order_id} sl={sl_price}")
+            return
+
+        print(f"SL VERIFY MISS -> fallback modify-preset: {symbol} order_id={order_id} sl={sl_price}")
+        bitmart_modify_preset_plan(symbol, order_id, sl_price)
+
+    except Exception as e:
+        print(f"SL VERIFY ERROR: {symbol} order_id={order_id} sl={sl_price} err={e}")
+
+# =========================
+# RESYNC HELPERS
 # =========================
 def _extract_positions_list(js: dict) -> List[dict]:
     data = js.get("data")
@@ -428,10 +511,6 @@ def update_vector_buffer(s: Dict[str, Any], bar_key: Optional[str], color: str) 
     s["last_vector_ts"] = now_ts()
 
 def entry_allowed_by_vector_debounce(s: Dict[str, Any], bar_key: Optional[str], color: str) -> bool:
-    """
-    Only used for ENTRY on VECTOR.
-    EXIT stays immediate.
-    """
     if not bar_key:
         return True
 
@@ -496,8 +575,7 @@ def webhook():
             update_vector_buffer(s, bk, color)
 
     # Decide action: EXIT > ENTRY
-    action: Optional[str] = None
-    action = should_exit(s, event, payload)
+    action: Optional[str] = should_exit(s, event, payload)
     if action is None:
         action = should_enter(s, event, payload)
 
@@ -547,12 +625,20 @@ def webhook():
         r = bitmart_open_market(symbol, "LONG", sl_price)
 
         # Only update state if entry succeeded
-        if int(r.get("http") or 0) == 200 and isinstance(r.get("json"), dict) and r["json"].get("code") in (1000, "1000"):
+        ok = int(r.get("http") or 0) == 200 and isinstance(r.get("json"), dict) and r["json"].get("code") in (1000, "1000")
+        if ok:
             s["in_position"] = True
             s["side"] = "LONG"
             s["last_entry_bar_key"] = bk
             s["last_action_bar_key"] = bk
             s["last_action_type"] = "ENTRY"
+
+            # Post-entry verify/fallback SL (NEW)
+            try:
+                order_id = (r.get("json") or {}).get("data", {}).get("order_id")
+                ensure_sl_present(symbol, order_id, sl_price)
+            except Exception as e:
+                print(f"POST-ENTRY SL ERROR: {symbol} -> {e}")
         else:
             print(f"ENTRY FAILED -> STATE NOT UPDATED: {symbol} action={action} resp={r}")
 
@@ -566,12 +652,21 @@ def webhook():
 
         r = bitmart_open_market(symbol, "SHORT", sl_price)
 
-        if int(r.get("http") or 0) == 200 and isinstance(r.get("json"), dict) and r["json"].get("code") in (1000, "1000"):
+        ok = int(r.get("http") or 0) == 200 and isinstance(r.get("json"), dict) and r["json"].get("code") in (1000, "1000")
+        if ok:
             s["in_position"] = True
             s["side"] = "SHORT"
             s["last_entry_bar_key"] = bk
+            s["last	tf	"
             s["last_action_bar_key"] = bk
             s["last_action_type"] = "ENTRY"
+
+            # Post-entry verify/fallback SL (NEW)
+            try:
+                order_id = (r.get("json") or {}).get("data", {}).get("order_id")
+                ensure_sl_present(symbol, order_id, sl_price)
+            except Exception as e:
+                print(f"POST-ENTRY SL ERROR: {symbol} -> {e}")
         else:
             print(f"ENTRY FAILED -> STATE NOT UPDATED: {symbol} action={action} resp={r}")
 
@@ -607,6 +702,7 @@ def health():
         "open_type": OPEN_TYPE,
         "vector_entry_debounce_sec": VECTOR_ENTRY_DEBOUNCE_SEC,
         "resync_before_trade": RESYNC_BEFORE_TRADE,
+        "post_entry_verify_sl": POST_ENTRY_VERIFY_SL,
         "allowed_symbols": sorted(list(ALLOWED_SYMBOLS)),
         "state": {
             s: {
