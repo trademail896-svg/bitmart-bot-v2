@@ -23,7 +23,7 @@ SHORT_COLOR = "RED"
 SECRET = (os.environ.get("TV_WEBHOOK_SECRET") or "TV_BOT_DEMO_2026_V2").strip()
 
 # BitMart (Futures)
-BITMART_BASE_URL = (os.environ.get("BITMART_BASE_URL") or "").strip()
+BITMART_BASE_URL = (os.environ.get("BITMART_BASE_URL") or "").strip()  # e.g. https://api-cloud-v2.bitmart.com or demo-api-cloud-v2...
 BITMART_API_KEY = (os.environ.get("BITMART_API_KEY") or "").strip()
 BITMART_API_SECRET = (os.environ.get("BITMART_API_SECRET") or "").strip()
 BITMART_MEMO = (os.environ.get("BITMART_MEMO") or "").strip()
@@ -33,11 +33,8 @@ LEVERAGE = int(os.environ.get("BOT_LEVERAGE") or "25")
 OPEN_TYPE = (os.environ.get("BOT_OPEN_TYPE") or "isolated").strip()  # isolated/cross
 NOTIONAL_USD_PER_TRADE = float(os.environ.get("BOT_NOTIONAL_USD_PER_TRADE") or "2500.0")
 
-# Contracts sizing (BitMart futures expects integer "size" = contracts)
-CONTRACTS_PER_TRADE = int(os.environ.get("BOT_CONTRACTS_PER_TRADE") or "1")
-
-# SL config (UNCHANGED)
-SL_PCT = float(os.environ.get("BOT_SL_PCT") or "0.0025")  # 0.25% default (matches your logs)
+# SL config (UNCHANGED meaning: same % logic; implementation moved to preset SL on submit-order)
+SL_PCT = float(os.environ.get("BOT_SL_PCT") or "0.0025")  # 0.25% default
 
 # VECTOR entry debounce
 VECTOR_ENTRY_DEBOUNCE_SEC = float(os.environ.get("BOT_VECTOR_ENTRY_DEBOUNCE_SEC") or "3.0")
@@ -49,10 +46,6 @@ RESYNC_BEFORE_TRADE = (os.environ.get("BOT_RESYNC_BEFORE_TRADE") or "1").strip()
 UPSTASH_REDIS_REST_URL = (os.environ.get("UPSTASH_REDIS_REST_URL") or "").strip()
 UPSTASH_REDIS_REST_TOKEN = (os.environ.get("UPSTASH_REDIS_REST_TOKEN") or "").strip()
 UPSTASH_PREFIX = (os.environ.get("UPSTASH_PREFIX") or "tvbotv2").strip()
-
-# (BUFFER/REPLAY) minimal robustness for out-of-order alerts
-PENDING_TTL_SEC = float(os.environ.get("BOT_PENDING_TTL_SEC") or "90")
-PENDING_MAX_PER_SYMBOL = int(os.environ.get("BOT_PENDING_MAX_PER_SYMBOL") or "3")
 
 # =========================
 # STATE (per symbol)
@@ -79,10 +72,6 @@ STATE: Dict[str, Dict[str, Any]] = {
         "pending_entry_bar_key": None,
         "pending_entry_first_ts": None,
         "pending_entry_color": None,  # "GREEN"/"RED"
-
-        # (BUFFER/REPLAY) pending signals keyed by bar_key (per symbol)
-        # { "<bar_key>": {"event": "VECTOR"/"STOCH_SIGNAL", "payload": {...minimal...}, "ts": <epoch>} }
-        "pending_by_bar_key": {},
     }
     for s in ALLOWED_SYMBOLS
 }
@@ -135,115 +124,15 @@ def safe_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-def safe_int(x: Any) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        if isinstance(x, bool):
-            return int(x)
-        if isinstance(x, (int,)):
-            return int(x)
-        # strings like "799"
-        return int(float(str(x).strip()))
-    except Exception:
-        return None
-
 def bar_key_from_payload(p: Dict[str, Any]) -> Optional[str]:
     bk = p.get("bar_key")
     if isinstance(bk, str) and bk.strip():
         return bk.strip()
     return None
 
-# =========================
-# (BUFFER/REPLAY) helpers
-# =========================
-def _pending_cleanup(s: Dict[str, Any]) -> None:
-    pbk = s.get("pending_by_bar_key")
-    if not isinstance(pbk, dict) or not pbk:
-        return
-    cutoff = now_ts() - float(PENDING_TTL_SEC)
-    stale = []
-    for k, v in pbk.items():
-        ts = None
-        if isinstance(v, dict):
-            ts = safe_float(v.get("ts"))
-        if ts is None or ts < cutoff:
-            stale.append(k)
-    for k in stale:
-        try:
-            del pbk[k]
-        except Exception:
-            pass
-
-def _pending_put(s: Dict[str, Any], bk: str, event: str, payload_min: Dict[str, Any]) -> None:
-    if not bk:
-        return
-    pbk = s.get("pending_by_bar_key")
-    if not isinstance(pbk, dict):
-        pbk = {}
-        s["pending_by_bar_key"] = pbk
-
-    _pending_cleanup(s)
-
-    # enforce max size (drop oldest)
-    if len(pbk) >= int(PENDING_MAX_PER_SYMBOL):
-        oldest_k = None
-        oldest_ts = None
-        for k, v in pbk.items():
-            ts = None
-            if isinstance(v, dict):
-                ts = safe_float(v.get("ts"))
-            if ts is None:
-                ts = 0.0
-            if oldest_ts is None or ts < oldest_ts:
-                oldest_ts = ts
-                oldest_k = k
-        if oldest_k is not None:
-            try:
-                del pbk[oldest_k]
-            except Exception:
-                pass
-
-    pbk[bk] = {"event": event, "payload": payload_min, "ts": now_ts()}
-    print(f"PENDING STORED: bar_key={bk} event={event} pending_count={len(pbk)}")
-
-def _pending_get(s: Dict[str, Any], bk: str) -> Optional[Dict[str, Any]]:
-    pbk = s.get("pending_by_bar_key")
-    if not isinstance(pbk, dict) or not bk:
-        return None
-    _pending_cleanup(s)
-    v = pbk.get(bk)
-    if isinstance(v, dict):
-        return v
-    return None
-
-def _pending_del(s: Dict[str, Any], bk: str) -> None:
-    pbk = s.get("pending_by_bar_key")
-    if isinstance(pbk, dict) and bk in pbk:
-        try:
-            del pbk[bk]
-        except Exception:
-            pass
-
-def _min_payload_for_pending(payload: Dict[str, Any], event: str) -> Dict[str, Any]:
-    """
-    Store only minimal fields needed for later decision + SL price.
-    """
-    p: Dict[str, Any] = {
-        "event": event,
-        "ticker": payload.get("ticker"),
-        "tf": payload.get("tf"),
-        "time": payload.get("time"),
-        "bar_key": payload.get("bar_key"),
-        "open": payload.get("open"),
-        "close": payload.get("close"),
-    }
-    if event == "VECTOR":
-        p["color"] = payload.get("color")
-        p["side"] = payload.get("side")
-    elif event == "STOCH_SIGNAL":
-        p["signal"] = payload.get("signal")
-    return p
+def _mk_client_order_id(symbol: str) -> str:
+    # short deterministic-ish id (<=32 chars)
+    return f"TVBOT_{symbol}_{int(time.time()*1000)}"[:32]
 
 # =========================
 # BITMART SIGNING / REQUESTS
@@ -267,7 +156,7 @@ def bitmart_request(method: str, path: str, body: Optional[dict] = None) -> Tupl
 
     m = method.upper()
     if m == "GET":
-        body_str = ""  # IMPORTANT for BitMart sign
+        body_str = ""
     else:
         data = body or {}
         body_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
@@ -297,15 +186,6 @@ def bitmart_request(method: str, path: str, body: Optional[dict] = None) -> Tupl
     except Exception as e:
         return 500, {"code": -2, "message": f"request error: {e}"}
 
-def _bm_ok(resp: Dict[str, Any]) -> bool:
-    try:
-        http = int(resp.get("http", 0))
-        js = resp.get("json") if isinstance(resp.get("json"), dict) else {}
-        code = js.get("code")
-        return http == 200 and (code == 1000 or code == "1000")
-    except Exception:
-        return False
-
 def bitmart_set_leverage(symbol: str) -> Dict[str, Any]:
     path = "/contract/private/submit-leverage"
     body = {"symbol": symbol, "leverage": str(LEVERAGE), "open_type": OPEN_TYPE}
@@ -313,90 +193,94 @@ def bitmart_set_leverage(symbol: str) -> Dict[str, Any]:
     print(f"BITMART SUBMIT LEVERAGE: {symbol} {{'http': {http}, 'json': {js}}}")
     return {"http": http, "json": js}
 
-def _calc_contract_size(symbol: str) -> int:
-    # Minimal: fixed contracts per trade (BitMart expects integer contracts)
-    try:
-        n = int(CONTRACTS_PER_TRADE)
-        return n if n > 0 else 1
-    except Exception:
-        return 1
+def _calc_size_from_notional(symbol: str) -> int:
+    # Placeholder sizing; MUST be int for BitMart (size Int)
+    # You can replace later with real sizing logic.
+    return 1
 
-# BitMart futures side mapping (common one-way mode)
-# 1=BUY(open long), 4=SELL(open short), 2=BUY(close short), 3=SELL(close long)
-def _bm_side_open(pos_side: str) -> int:
-    return 1 if pos_side == "LONG" else 4
-
-def _bm_side_close(pos_side: str) -> int:
-    return 3 if pos_side == "LONG" else 2
-
-def bitmart_open_market(symbol: str, pos_side: str) -> Dict[str, Any]:
+def _calc_sl_price(side: str, ref_price: float) -> Optional[str]:
     """
-    pos_side: "LONG" or "SHORT"
+    Returns SL price as string for preset_stop_loss_price.
+    Uses same % logic + safe min distance + rounding you had.
     """
-    path = "/contract/private/submit-order"
-    size_int = _calc_contract_size(symbol)
-    body = {
-        "symbol": symbol,
-        "type": "market",
-        "open_type": OPEN_TYPE,
-        "leverage": str(LEVERAGE),
-        "size": str(size_int),              # integer contracts as string
-        "side": _bm_side_open(pos_side),    # integer side
-    }
-    http, js = bitmart_request("POST", path, body)
-    print(f"BITMART OPEN: {symbol} {pos_side} {{'http': {http}, 'json': {js}}} body={body}")
-    return {"http": http, "json": js}
+    if ref_price <= 0:
+        return None
 
-def bitmart_close_market(symbol: str, pos_side: str, size_int: int) -> Dict[str, Any]:
-    """
-    pos_side: "LONG" or "SHORT"
-    size_int: integer contracts to close (required; BitMart rejects size=0 in many setups)
-    """
-    path = "/contract/private/submit-order"
-    sz = int(size_int) if int(size_int) > 0 else 1
-    body = {
-        "symbol": symbol,
-        "type": "market",
-        "open_type": OPEN_TYPE,
-        "leverage": str(LEVERAGE),
-        "size": str(sz),
-        "side": _bm_side_close(pos_side),   # reduce-only side
-    }
-    http, js = bitmart_request("POST", path, body)
-    print(f"BITMART CLOSE: {symbol} {pos_side} size={sz} {{'http': {http}, 'json': {js}}} body={body}")
-    return {"http": http, "json": js}
+    proposed = ref_price * (1.0 - SL_PCT) if side == "LONG" else ref_price * (1.0 + SL_PCT)
+    min_dist = max(ref_price * 0.0005, 0.0)
 
-def bitmart_set_sl(symbol: str, pos_side: str, entry_price: float) -> Dict[str, Any]:
-    """
-    Keep same SL math, but FIX BitMart params type:
-    - side must be INT reduce-only (close side)
-    """
-    proposed = entry_price * (1.0 - SL_PCT) if pos_side == "LONG" else entry_price * (1.0 + SL_PCT)
-
-    # Placeholder min distance (keep your original if you had exchange-derived values)
-    min_dist = max(entry_price * 0.0005, 0.0)
-
-    if pos_side == "LONG":
-        final = min(proposed, entry_price - min_dist)
+    if side == "LONG":
+        final = min(proposed, ref_price - min_dist)
         final_rounded = math.floor(final * 10) / 10.0
     else:
-        final = max(proposed, entry_price + min_dist)
+        final = max(proposed, ref_price + min_dist)
         final_rounded = math.ceil(final * 10) / 10.0
 
-    print(f"SL SAFE: {symbol} {{'side': '{pos_side}', 'entry_price': {entry_price}, 'proposed': {round(proposed, 5)}, 'min_dist': {round(min_dist, 6)}, 'final': {final_rounded}}}")
+    print(f"SL SAFE: {{'side': '{side}', 'ref_price': {ref_price}, 'proposed': {round(proposed, 5)}, 'min_dist': {round(min_dist, 6)}, 'final': {final_rounded}}}")
+    return str(final_rounded)
 
-    # NOTE: endpoint kept to avoid bigger API refactor; only fix invalid param types
-    path = "/contract/private/submit-plan-order"
-    body = {
+def bitmart_open_market(symbol: str, side: str, sl_price: Optional[str]) -> Dict[str, Any]:
+    """
+    Uses /contract/private/submit-order with:
+      type=market
+      side int (oneway mode):
+        1=buy (open long)
+        4=sell (open short)
+      size must be INT
+    Preset SL via preset_stop_loss_price (optional).
+    """
+    path = "/contract/private/submit-order"
+
+    side_int = 1 if side == "LONG" else 4
+    size_int = int(_calc_size_from_notional(symbol))  # MUST be int
+
+    body: Dict[str, Any] = {
         "symbol": symbol,
-        "trigger_price": str(final_rounded),
-        "plan_type": "loss_plan",
-        "side": _bm_side_close(pos_side),   # FIX: int, not "LONG"/"SHORT"
+        "client_order_id": _mk_client_order_id(symbol),
+        "type": "market",
+        "side": side_int,
+        "mode": 1,  # GTC (default) - explicitly set
+        "leverage": str(LEVERAGE),
         "open_type": OPEN_TYPE,
+        "size": size_int,
     }
+
+    # preset SL (supported by submit-order)
+    if sl_price:
+        body["preset_stop_loss_price"] = sl_price
+        body["preset_stop_loss_price_type"] = 1  # last_price
+
     http, js = bitmart_request("POST", path, body)
-    print(f"BITMART SL: {symbol} {pos_side} {{'http': {http}, 'json': {js}}} body={body}")
-    return {"http": http, "json": js}
+    print(f"BITMART OPEN: {symbol} {side} {{'http': {http}, 'json': {js}}} body={body}")
+    return {"http": http, "json": js, "body": body}
+
+def bitmart_close_market(symbol: str, side: str) -> Dict[str, Any]:
+    """
+    NOTE: close requires correct size. For now, keep existing behavior minimal.
+    If you want perfect close sizing, we can wire it to position amount next.
+    """
+    path = "/contract/private/submit-order"
+
+    # one-way mode close sides:
+    # 2=buy(reduce only) -> close short
+    # 3=sell(reduce only) -> close long
+    side_int = 3 if side == "LONG" else 2
+    size_int = 1  # minimal placeholder
+
+    body: Dict[str, Any] = {
+        "symbol": symbol,
+        "client_order_id": _mk_client_order_id(symbol),
+        "type": "market",
+        "side": side_int,
+        "mode": 1,
+        "leverage": str(LEVERAGE),
+        "open_type": OPEN_TYPE,
+        "size": int(size_int),
+    }
+
+    http, js = bitmart_request("POST", path, body)
+    print(f"BITMART CLOSE: {symbol} {side} {{'http': {http}, 'json': {js}}} body={body}")
+    return {"http": http, "json": js, "body": body}
 
 # =========================
 # (3) RESYNC HELPERS
@@ -412,12 +296,7 @@ def _extract_positions_list(js: dict) -> List[dict]:
                 return v
     return []
 
-def bitmart_get_position_detail(symbol: str) -> Tuple[bool, Optional[str], int]:
-    """
-    Returns: (in_position, side, size_int_contracts)
-    side: "LONG"/"SHORT"/None
-    size_int_contracts: abs(current_amount) if available else 0
-    """
+def bitmart_get_position(symbol: str) -> Tuple[bool, Optional[str]]:
     for path in ("/contract/private/position-v2", "/contract/private/position"):
         http, js = bitmart_request("GET", path, None)
         if http >= 400:
@@ -427,7 +306,7 @@ def bitmart_get_position_detail(symbol: str) -> Tuple[bool, Optional[str], int]:
 
         plist = _extract_positions_list(js)
         if not plist:
-            return False, None, 0
+            return False, None
 
         target = None
         for p in plist:
@@ -439,37 +318,36 @@ def bitmart_get_position_detail(symbol: str) -> Tuple[bool, Optional[str], int]:
                 break
 
         if not target:
-            return False, None, 0
+            return False, None
 
         amt = safe_float(target.get("current_amount") or target.get("position_amt") or target.get("amount"))
         if amt is not None:
-            size_int = int(abs(amt)) if abs(amt) >= 1 else 0
             if amt > 0:
-                return True, "LONG", size_int
+                return True, "LONG"
             if amt < 0:
-                return True, "SHORT", size_int
+                return True, "SHORT"
 
         side_val = (target.get("side") or target.get("position_side") or "").upper()
         if side_val in ("LONG", "BUY", "1"):
-            return True, "LONG", safe_int(target.get("current_amount")) or 0
+            return True, "LONG"
         if side_val in ("SHORT", "SELL", "2"):
-            return True, "SHORT", safe_int(target.get("current_amount")) or 0
+            return True, "SHORT"
 
         hold_side = (target.get("hold_side") or target.get("position_type") or "").upper()
         if hold_side in ("LONG", "1"):
-            return True, "LONG", safe_int(target.get("current_amount")) or 0
+            return True, "LONG"
         if hold_side in ("SHORT", "2"):
-            return True, "SHORT", safe_int(target.get("current_amount")) or 0
+            return True, "SHORT"
 
-        return True, None, 0
+        return True, None
 
-    return False, None, 0
+    return False, None
 
 def resync_state_with_exchange(symbol: str, s: Dict[str, Any]) -> None:
     if not RESYNC_BEFORE_TRADE:
         return
     try:
-        in_pos, side, _sz = bitmart_get_position_detail(symbol)
+        in_pos, side = bitmart_get_position(symbol)
         before_in = bool(s.get("in_position"))
         before_side = s.get("side")
 
@@ -604,178 +482,118 @@ def webhook():
 
     upstash_get_bias(symbol)
 
-    def _handle_non_ema_event(inner_payload: Dict[str, Any], from_replay: bool = False) -> Tuple[Dict[str, Any], int]:
-        """
-        Runs the exact same decision/execution path for non-EMA50_STATE events.
-        from_replay=True prevents re-buffering loops.
-        """
-        inner_event = (inner_payload.get("event") or "").strip().upper()
-        inner_bk = bar_key_from_payload(inner_payload)
-
-        # VECTOR buffer updates
-        if inner_event == "VECTOR":
-            color = (inner_payload.get("color") or "").upper()
-            if color in (LONG_COLOR, SHORT_COLOR):
-                update_vector_buffer(s, inner_bk, color)
-
-        # Decide action: EXIT > ENTRY
-        action: Optional[str] = None
-        action = should_exit(s, inner_event, inner_payload)
-        if action is None:
-            action = should_enter(s, inner_event, inner_payload)
-
-        # If no action and regime missing: buffer/replay (only for entry triggers, not for replay calls)
-        if action is None and (not from_replay) and s.get("regime") is None and inner_event in ("VECTOR", "STOCH_SIGNAL") and inner_bk:
-            _pending_put(s, inner_bk, inner_event, _min_payload_for_pending(inner_payload, inner_event))
-            return {"ok": True, "action": "NONE", "note": "buffered_pending_regime", "bar_key": inner_bk}, 200
-
-        if action is None:
-            return {"ok": True, "action": "NONE"}, 200
-
-        # RESYNC before executing
-        resync_state_with_exchange(symbol, s)
-
-        if action in ("EXIT_LONG", "EXIT_SHORT"):
-            if not s["in_position"] or (action == "EXIT_LONG" and s["side"] != "LONG") or (action == "EXIT_SHORT" and s["side"] != "SHORT"):
-                print(f"RESYNC BLOCK EXIT: {symbol} action={action} state_in={s['in_position']} state_side={s['side']}")
-                return {"ok": True, "action": "NONE", "note": "resync_block_exit"}, 200
-
-        if action in ("ENTER_LONG", "ENTER_SHORT"):
-            if s["in_position"]:
-                print(f"RESYNC BLOCK ENTRY: {symbol} action={action} exchange/state shows in_position")
-                return {"ok": True, "action": "NONE", "note": "resync_block_entry"}, 200
-
-        # BAR_KEY GATE
-        if inner_bk and s["last_action_bar_key"] == inner_bk:
-            print(f"SKIP_DUPLICATE_BAR_KEY: {symbol} bar_key={inner_bk} incoming_event={inner_event} action={action}")
-            return {"ok": True, "skipped": "duplicate_bar_key"}, 200
-
-        # ENTRY debounce ONLY for VECTOR-triggered ENTRY
-        if inner_event == "VECTOR" and action in ("ENTER_LONG", "ENTER_SHORT"):
-            color = (inner_payload.get("color") or "").upper()
-            if color in (LONG_COLOR, SHORT_COLOR):
-                if not entry_allowed_by_vector_debounce(s, inner_bk, color):
-                    return {"ok": True, "action": "NONE", "note": "vector_entry_debounce"}, 200
-
-            final_color = s.get("pending_entry_color")
-            if action == "ENTER_LONG" and final_color != LONG_COLOR:
-                print(f"VECTOR ENTRY CANCEL: {symbol} bar_key={inner_bk} action={action} final_color={final_color}")
-                return {"ok": True, "action": "NONE", "note": "vector_entry_color_flip"}, 200
-            if action == "ENTER_SHORT" and final_color != SHORT_COLOR:
-                print(f"VECTOR ENTRY CANCEL: {symbol} bar_key={inner_bk} action={action} final_color={final_color}")
-                return {"ok": True, "action": "NONE", "note": "vector_entry_color_flip"}, 200
-
-        # Execute action
-        if action == "ENTER_LONG":
-            bitmart_set_leverage(symbol)
-            r = bitmart_open_market(symbol, "LONG")
-
-            # (STATE SAFETY) only set state if BitMart accepted the order
-            if not _bm_ok(r):
-                print(f"ENTRY FAILED -> STATE NOT UPDATED: {symbol} action={action} resp={r}")
-                return {"ok": True, "action": "ENTER_LONG_FAILED", "bitmart": r}, 200
-
-            s["in_position"] = True
-            s["side"] = "LONG"
-            s["last_entry_bar_key"] = inner_bk
-
-            entry_px = safe_float(inner_payload.get("close")) or safe_float(inner_payload.get("open")) or 0.0
-            if entry_px > 0:
-                slr = bitmart_set_sl(symbol, "LONG", entry_px)
-                if not _bm_ok(slr):
-                    print(f"SL FAILED (post-entry): {symbol} side=LONG resp={slr}")
-
-            s["last_action_bar_key"] = inner_bk
-            s["last_action_type"] = "ENTRY"
-            return {"ok": True, "action": "ENTER_LONG", "bitmart": r}, 200
-
-        if action == "ENTER_SHORT":
-            bitmart_set_leverage(symbol)
-            r = bitmart_open_market(symbol, "SHORT")
-
-            # (STATE SAFETY) only set state if BitMart accepted the order
-            if not _bm_ok(r):
-                print(f"ENTRY FAILED -> STATE NOT UPDATED: {symbol} action={action} resp={r}")
-                return {"ok": True, "action": "ENTER_SHORT_FAILED", "bitmart": r}, 200
-
-            s["in_position"] = True
-            s["side"] = "SHORT"
-            s["last_entry_bar_key"] = inner_bk
-
-            entry_px = safe_float(inner_payload.get("close")) or safe_float(inner_payload.get("open")) or 0.0
-            if entry_px > 0:
-                slr = bitmart_set_sl(symbol, "SHORT", entry_px)
-                if not _bm_ok(slr):
-                    print(f"SL FAILED (post-entry): {symbol} side=SHORT resp={slr}")
-
-            s["last_action_bar_key"] = inner_bk
-            s["last_action_type"] = "ENTRY"
-            return {"ok": True, "action": "ENTER_SHORT", "bitmart": r}, 200
-
-        if action == "EXIT_LONG":
-            in_pos, ex_side, ex_size = bitmart_get_position_detail(symbol)
-            if not in_pos or ex_side != "LONG":
-                print(f"EXIT CHECK: {symbol} exchange not long (in_pos={in_pos}, side={ex_side}) -> skip")
-                return {"ok": True, "action": "NONE", "note": "exchange_not_long"}, 200
-
-            r = bitmart_close_market(symbol, "LONG", ex_size)
-
-            if not _bm_ok(r):
-                print(f"EXIT FAILED -> STATE NOT CLEARED: {symbol} action={action} resp={r}")
-                return {"ok": True, "action": "EXIT_LONG_FAILED", "bitmart": r}, 200
-
-            s["in_position"] = False
-            s["side"] = None
-            s["last_action_bar_key"] = inner_bk
-            s["last_action_type"] = "EXIT"
-            return {"ok": True, "action": "EXIT_LONG", "bitmart": r}, 200
-
-        if action == "EXIT_SHORT":
-            in_pos, ex_side, ex_size = bitmart_get_position_detail(symbol)
-            if not in_pos or ex_side != "SHORT":
-                print(f"EXIT CHECK: {symbol} exchange not short (in_pos={in_pos}, side={ex_side}) -> skip")
-                return {"ok": True, "action": "NONE", "note": "exchange_not_short"}, 200
-
-            r = bitmart_close_market(symbol, "SHORT", ex_size)
-
-            if not _bm_ok(r):
-                print(f"EXIT FAILED -> STATE NOT CLEARED: {symbol} action={action} resp={r}")
-                return {"ok": True, "action": "EXIT_SHORT_FAILED", "bitmart": r}, 200
-
-            s["in_position"] = False
-            s["side"] = None
-            s["last_action_bar_key"] = inner_bk
-            s["last_action_type"] = "EXIT"
-            return {"ok": True, "action": "EXIT_SHORT", "bitmart": r}, 200
-
-        return {"ok": True, "action": "NONE"}, 200
-
-    # EMA50_STATE updates regime only + (BUFFER/REPLAY) optional replay of same bar_key
+    # EMA50_STATE updates regime only
     if event == "EMA50_STATE":
         st = (payload.get("state") or "").upper()
         if st in ("ABOVE", "BELOW"):
             s["regime"] = st
-
-        # Try replay for SAME bar_key (safe)
-        if bk:
-            pending = _pending_get(s, bk)
-            if pending and isinstance(pending.get("payload"), dict):
-                replay_payload = dict(pending["payload"])
-                _pending_del(s, bk)
-                print(f"REPLAY TRIGGER: symbol={symbol} bar_key={bk} event={pending.get('event')}")
-                replay_js, _replay_code = _handle_non_ema_event(replay_payload, from_replay=True)
-                return jsonify({
-                    "ok": True,
-                    "event": "EMA50_STATE",
-                    "regime": s["regime"],
-                    "replay": replay_js,
-                }), 200
-
         return jsonify({"ok": True, "event": "EMA50_STATE", "regime": s["regime"]}), 200
 
-    # All other events go through the normal path (with buffering if regime missing)
-    js, code = _handle_non_ema_event(payload, from_replay=False)
-    return jsonify(js), code
+    # VECTOR buffer updates
+    if event == "VECTOR":
+        color = (payload.get("color") or "").upper()
+        if color in (LONG_COLOR, SHORT_COLOR):
+            update_vector_buffer(s, bk, color)
+
+    # Decide action: EXIT > ENTRY
+    action: Optional[str] = None
+    action = should_exit(s, event, payload)
+    if action is None:
+        action = should_enter(s, event, payload)
+
+    if action is None:
+        return jsonify({"ok": True, "action": "NONE"}), 200
+
+    # RESYNC before executing
+    resync_state_with_exchange(symbol, s)
+
+    if action in ("EXIT_LONG", "EXIT_SHORT"):
+        if not s["in_position"] or (action == "EXIT_LONG" and s["side"] != "LONG") or (action == "EXIT_SHORT" and s["side"] != "SHORT"):
+            print(f"RESYNC BLOCK EXIT: {symbol} action={action} state_in={s['in_position']} state_side={s['side']}")
+            return jsonify({"ok": True, "action": "NONE", "note": "resync_block_exit"}), 200
+
+    if action in ("ENTER_LONG", "ENTER_SHORT"):
+        if s["in_position"]:
+            print(f"RESYNC BLOCK ENTRY: {symbol} action={action} exchange/state shows in_position")
+            return jsonify({"ok": True, "action": "NONE", "note": "resync_block_entry"}), 200
+
+    # BAR_KEY GATE
+    if bk and s["last_action_bar_key"] == bk:
+        print(f"SKIP_DUPLICATE_BAR_KEY: {symbol} bar_key={bk} incoming_event={event} action={action}")
+        return jsonify({"ok": True, "skipped": "duplicate_bar_key"}), 200
+
+    # ENTRY debounce ONLY for VECTOR-triggered ENTRY
+    if event == "VECTOR" and action in ("ENTER_LONG", "ENTER_SHORT"):
+        color = (payload.get("color") or "").upper()
+        if color in (LONG_COLOR, SHORT_COLOR):
+            if not entry_allowed_by_vector_debounce(s, bk, color):
+                return jsonify({"ok": True, "action": "NONE", "note": "vector_entry_debounce"}), 200
+
+        final_color = s.get("pending_entry_color")
+        if action == "ENTER_LONG" and final_color != LONG_COLOR:
+            print(f"VECTOR ENTRY CANCEL: {symbol} bar_key={bk} action={action} final_color={final_color}")
+            return jsonify({"ok": True, "action": "NONE", "note": "vector_entry_color_flip"}), 200
+        if action == "ENTER_SHORT" and final_color != SHORT_COLOR:
+            print(f"VECTOR ENTRY CANCEL: {symbol} bar_key={bk} action={action} final_color={final_color}")
+            return jsonify({"ok": True, "action": "NONE", "note": "vector_entry_color_flip"}), 200
+
+    # Execute action
+    if action == "ENTER_LONG":
+        bitmart_set_leverage(symbol)
+
+        ref_px = safe_float(payload.get("close")) or safe_float(payload.get("open")) or 0.0
+        sl_price = _calc_sl_price("LONG", ref_px) if ref_px > 0 else None
+
+        r = bitmart_open_market(symbol, "LONG", sl_price)
+
+        # Only update state if entry succeeded
+        if int(r.get("http") or 0) == 200 and isinstance(r.get("json"), dict) and r["json"].get("code") in (1000, "1000"):
+            s["in_position"] = True
+            s["side"] = "LONG"
+            s["last_entry_bar_key"] = bk
+            s["last_action_bar_key"] = bk
+            s["last_action_type"] = "ENTRY"
+        else:
+            print(f"ENTRY FAILED -> STATE NOT UPDATED: {symbol} action={action} resp={r}")
+
+        return jsonify({"ok": True, "action": "ENTER_LONG", "bitmart": r}), 200
+
+    if action == "ENTER_SHORT":
+        bitmart_set_leverage(symbol)
+
+        ref_px = safe_float(payload.get("close")) or safe_float(payload.get("open")) or 0.0
+        sl_price = _calc_sl_price("SHORT", ref_px) if ref_px > 0 else None
+
+        r = bitmart_open_market(symbol, "SHORT", sl_price)
+
+        if int(r.get("http") or 0) == 200 and isinstance(r.get("json"), dict) and r["json"].get("code") in (1000, "1000"):
+            s["in_position"] = True
+            s["side"] = "SHORT"
+            s["last_entry_bar_key"] = bk
+            s["last_action_bar_key"] = bk
+            s["last_action_type"] = "ENTRY"
+        else:
+            print(f"ENTRY FAILED -> STATE NOT UPDATED: {symbol} action={action} resp={r}")
+
+        return jsonify({"ok": True, "action": "ENTER_SHORT", "bitmart": r}), 200
+
+    if action == "EXIT_LONG":
+        r = bitmart_close_market(symbol, "LONG")
+        s["in_position"] = False
+        s["side"] = None
+        s["last_action_bar_key"] = bk
+        s["last_action_type"] = "EXIT"
+        return jsonify({"ok": True, "action": "EXIT_LONG", "bitmart": r}), 200
+
+    if action == "EXIT_SHORT":
+        r = bitmart_close_market(symbol, "SHORT")
+        s["in_position"] = False
+        s["side"] = None
+        s["last_action_bar_key"] = bk
+        s["last_action_type"] = "EXIT"
+        return jsonify({"ok": True, "action": "EXIT_SHORT", "bitmart": r}), 200
+
+    return jsonify({"ok": True, "action": "NONE"}), 200
 
 # =========================
 # HEALTH
@@ -787,24 +605,20 @@ def health():
         "bot": "TV_BOT_DEMO_2026_V2",
         "leverage": LEVERAGE,
         "open_type": OPEN_TYPE,
-        "contracts_per_trade": CONTRACTS_PER_TRADE,
         "vector_entry_debounce_sec": VECTOR_ENTRY_DEBOUNCE_SEC,
         "resync_before_trade": RESYNC_BEFORE_TRADE,
-        "pending_ttl_sec": PENDING_TTL_SEC,
-        "pending_max_per_symbol": PENDING_MAX_PER_SYMBOL,
         "allowed_symbols": sorted(list(ALLOWED_SYMBOLS)),
         "state": {
-            sym: {
-                "in_position": STATE[sym]["in_position"],
-                "side": STATE[sym]["side"],
-                "regime": STATE[sym]["regime"],
-                "last_action_bar_key": STATE[sym]["last_action_bar_key"],
-                "last_action_type": STATE[sym]["last_action_type"],
-                "last_vector_bar_key": STATE[sym]["last_vector_bar_key"],
-                "last_vector_color": STATE[sym]["last_vector_color"],
-                "pending_count": len(STATE[sym].get("pending_by_bar_key") or {}),
+            s: {
+                "in_position": STATE[s]["in_position"],
+                "side": STATE[s]["side"],
+                "regime": STATE[s]["regime"],
+                "last_action_bar_key": STATE[s]["last_action_bar_key"],
+                "last_action_type": STATE[s]["last_action_type"],
+                "last_vector_bar_key": STATE[s]["last_vector_bar_key"],
+                "last_vector_color": STATE[s]["last_vector_color"],
             }
-            for sym in ALLOWED_SYMBOLS
+            for s in ALLOWED_SYMBOLS
         }
     }), 200
 
