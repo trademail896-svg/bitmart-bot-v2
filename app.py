@@ -134,25 +134,35 @@ def bar_key_from_payload(p: Dict[str, Any]) -> Optional[str]:
 # =========================
 # BITMART SIGNING / REQUESTS
 # =========================
-def _bitmart_sign(ts_ms: str, method: str, path: str, body: str) -> str:
+def _bitmart_sign(ts_ms: str, memo: str, body_str: str) -> str:
     """
-    Common BitMart signature pattern: HMAC_SHA256(secret, ts + method + path + body)
+    BitMart Futures signature (works for demo + live):
+      sign = HMAC_SHA256(secret, ts + "#" + memo + "#" + body)
+    Notes:
+      - body is "" for GET
+      - body is compact JSON for POST
     """
-    payload = f"{ts_ms}{method.upper()}{path}{body}"
-    return hmac.new(BITMART_API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    payload = f"{ts_ms}#{memo}#{body_str}"
+    return hmac.new(BITMART_API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 def bitmart_request(method: str, path: str, body: Optional[dict] = None) -> Tuple[int, dict]:
     if not BITMART_BASE_URL:
         return 500, {"code": -1, "message": "BITMART_BASE_URL missing"}
     if not BITMART_API_KEY or not BITMART_API_SECRET or not BITMART_MEMO:
-        return 500, {"code": -1, "message": "BitMart API credentials missing"}
+        return 500, {"code": -1, "message": "BitMart API credentials missing (need BITMART_API_KEY, BITMART_API_SECRET, BITMART_MEMO)"}
 
     url = BITMART_BASE_URL.rstrip("/") + path
     ts_ms = str(int(time.time() * 1000))
-    data = body or {}
-    body_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
 
-    sign = _bitmart_sign(ts_ms, method, path, body_str)
+    m = method.upper()
+    if m == "GET":
+        body_str = ""  # IMPORTANT for BitMart sign
+    else:
+        data = body or {}
+        body_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+
+    sign = _bitmart_sign(ts_ms, BITMART_MEMO, body_str)
+
     headers = {
         "Content-Type": "application/json",
         "X-BM-KEY": BITMART_API_KEY,
@@ -162,14 +172,16 @@ def bitmart_request(method: str, path: str, body: Optional[dict] = None) -> Tupl
     }
 
     try:
-        if method.upper() == "GET":
+        if m == "GET":
             r = requests.get(url, headers=headers, timeout=15)
         else:
-            r = requests.request(method.upper(), url, headers=headers, data=body_str, timeout=15)
+            r = requests.request(m, url, headers=headers, data=body_str, timeout=15)
+
         try:
             js = r.json()
         except Exception:
             js = {"code": -3, "message": "non-json response", "text": r.text[:500]}
+
         return r.status_code, js
     except Exception as e:
         return 500, {"code": -2, "message": f"request error: {e}"}
@@ -193,7 +205,7 @@ def bitmart_open_market(symbol: str, side: str) -> Dict[str, Any]:
         "open_type": OPEN_TYPE,
         "leverage": str(LEVERAGE),
         "size": str(_calc_size_from_notional(symbol)),
-        "side": side,  # "LONG"/"SHORT" (keep consistent with your previous implementation)
+        "side": side,  # "LONG"/"SHORT"
     }
     http, js = bitmart_request("POST", path, body)
     print(f"BITMART OPEN: {symbol} {side} {{'http': {http}, 'json': {js}}}")
@@ -255,7 +267,6 @@ def _extract_positions_list(js: dict) -> List[dict]:
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
-        # sometimes position list nested
         for k in ("positions", "position", "result"):
             v = data.get(k)
             if isinstance(v, list):
@@ -265,11 +276,10 @@ def _extract_positions_list(js: dict) -> List[dict]:
 def bitmart_get_position(symbol: str) -> Tuple[bool, Optional[str]]:
     """
     Returns: (in_position, side) where side is "LONG"/"SHORT" or None.
-    Uses documented endpoints:
-      - GET /contract/private/position-v2 (KEYED)
+    Uses:
+      - GET /contract/private/position-v2
       - fallback GET /contract/private/position
     """
-    # primary: position-v2 (KEYED)
     for path in ("/contract/private/position-v2", "/contract/private/position"):
         http, js = bitmart_request("GET", path, None)
         if http >= 400:
@@ -278,12 +288,9 @@ def bitmart_get_position(symbol: str) -> Tuple[bool, Optional[str]]:
             continue
 
         plist = _extract_positions_list(js)
-
-        # If empty => flat
         if not plist:
             return False, None
 
-        # Find symbol entry
         target = None
         for p in plist:
             if not isinstance(p, dict):
@@ -294,11 +301,8 @@ def bitmart_get_position(symbol: str) -> Tuple[bool, Optional[str]]:
                 break
 
         if not target:
-            # No matching symbol => flat for our symbol
             return False, None
 
-        # Derive side from common fields
-        # Examples seen in logs: current_amount; sometimes can be negative or separate fields.
         amt = safe_float(target.get("current_amount") or target.get("position_amt") or target.get("amount"))
         if amt is not None:
             if amt > 0:
@@ -312,17 +316,14 @@ def bitmart_get_position(symbol: str) -> Tuple[bool, Optional[str]]:
         if side_val in ("SHORT", "SELL", "2"):
             return True, "SHORT"
 
-        # Another pattern: "hold_side" or "position_type"
         hold_side = (target.get("hold_side") or target.get("position_type") or "").upper()
         if hold_side in ("LONG", "1"):
             return True, "LONG"
         if hold_side in ("SHORT", "2"):
             return True, "SHORT"
 
-        # If we can't determine but entry exists, treat as "in position unknown"
         return True, None
 
-    # If all failed, don't change state
     return False, None
 
 def resync_state_with_exchange(symbol: str, s: Dict[str, Any]) -> None:
@@ -340,7 +341,6 @@ def resync_state_with_exchange(symbol: str, s: Dict[str, Any]) -> None:
             s["side"] = None
             return
 
-        # in_pos True
         if side in ("LONG", "SHORT"):
             if (not before_in) or (before_side != side):
                 print(f"RESYNC: {symbol} EXCHANGE={side} but STATE=({before_side}) -> set {side}")
@@ -348,11 +348,9 @@ def resync_state_with_exchange(symbol: str, s: Dict[str, Any]) -> None:
             s["side"] = side
             return
 
-        # side unknown
         if not before_in:
             print(f"RESYNC: {symbol} EXCHANGE=IN_POSITION but side unknown; STATE was FLAT -> set in_position=True (side unchanged)")
             s["in_position"] = True
-            # keep side as-is (None)
     except Exception as e:
         print(f"RESYNC ERROR: {symbol} -> {e}")
 
@@ -418,10 +416,8 @@ def entry_allowed_by_vector_debounce(s: Dict[str, Any], bar_key: Optional[str], 
     EXIT stays immediate.
     """
     if not bar_key:
-        # no bar_key => cannot debounce reliably; allow
         return True
 
-    # new bar_key => start debounce window
     if s.get("pending_entry_bar_key") != bar_key:
         s["pending_entry_bar_key"] = bar_key
         s["pending_entry_first_ts"] = now_ts()
@@ -429,7 +425,6 @@ def entry_allowed_by_vector_debounce(s: Dict[str, Any], bar_key: Optional[str], 
         print(f"VECTOR ENTRY DEBOUNCE START: bar_key={bar_key} color={color}")
         return False
 
-    # same bar_key => update last color and check elapsed
     s["pending_entry_color"] = color
     first_ts = float(s.get("pending_entry_first_ts") or now_ts())
     elapsed = now_ts() - first_ts
@@ -456,7 +451,6 @@ def webhook():
 
     print(f"ALERTE: {payload}")
 
-    # Secret check
     if (payload.get("secret") or "").strip() != SECRET:
         return jsonify({"ok": False, "error": "bad secret"}), 403
 
@@ -469,49 +463,33 @@ def webhook():
     event = (payload.get("event") or "").strip().upper()
     bk = bar_key_from_payload(payload)
 
-    # Compatibility debug
     upstash_get_bias(symbol)
 
-    # -------------------------
-    # EMA50_STATE updates regime only (no trade action / no gate)
-    # -------------------------
+    # EMA50_STATE updates regime only
     if event == "EMA50_STATE":
         st = (payload.get("state") or "").upper()
         if st in ("ABOVE", "BELOW"):
             s["regime"] = st
         return jsonify({"ok": True, "event": "EMA50_STATE", "regime": s["regime"]}), 200
 
-    # -------------------------
-    # (2) VECTOR BUFFER always updates on VECTOR
-    # -------------------------
+    # VECTOR buffer updates
     if event == "VECTOR":
         color = (payload.get("color") or "").upper()
         if color in (LONG_COLOR, SHORT_COLOR):
             update_vector_buffer(s, bk, color)
 
-    # -------------------------
-    # Decide action based on priority: SL > EXIT > ENTRY
-    # (SL events not wired here; keeping original behavior)
-    # -------------------------
+    # Decide action: EXIT > ENTRY
     action: Optional[str] = None
-
-    # EXIT first
     action = should_exit(s, event, payload)
-
-    # ENTRY second
     if action is None:
         action = should_enter(s, event, payload)
 
-    # If no action => do nothing and do NOT set last_action_bar_key
     if action is None:
         return jsonify({"ok": True, "action": "NONE"}), 200
 
-    # -------------------------
-    # (3) RESYNC before executing ENTRY/EXIT
-    # -------------------------
+    # RESYNC before executing
     resync_state_with_exchange(symbol, s)
 
-    # Re-check validity after resync
     if action in ("EXIT_LONG", "EXIT_SHORT"):
         if not s["in_position"] or (action == "EXIT_LONG" and s["side"] != "LONG") or (action == "EXIT_SHORT" and s["side"] != "SHORT"):
             print(f"RESYNC BLOCK EXIT: {symbol} action={action} state_in={s['in_position']} state_side={s['side']}")
@@ -522,24 +500,18 @@ def webhook():
             print(f"RESYNC BLOCK ENTRY: {symbol} action={action} exchange/state shows in_position")
             return jsonify({"ok": True, "action": "NONE", "note": "resync_block_entry"}), 200
 
-    # -------------------------
-    # BAR_KEY GATE: 1 ACTION max per bar_key (trade actions only)
-    # -------------------------
+    # BAR_KEY GATE
     if bk and s["last_action_bar_key"] == bk:
         print(f"SKIP_DUPLICATE_BAR_KEY: {symbol} bar_key={bk} incoming_event={event} action={action}")
         return jsonify({"ok": True, "skipped": "duplicate_bar_key"}), 200
 
-    # -------------------------
-    # (2) ENTRY debounce ONLY for VECTOR-triggered ENTRY
-    # -------------------------
+    # ENTRY debounce ONLY for VECTOR-triggered ENTRY
     if event == "VECTOR" and action in ("ENTER_LONG", "ENTER_SHORT"):
         color = (payload.get("color") or "").upper()
         if color in (LONG_COLOR, SHORT_COLOR):
             if not entry_allowed_by_vector_debounce(s, bk, color):
-                # no trade action executed => do NOT set last_action_bar_key
                 return jsonify({"ok": True, "action": "NONE", "note": "vector_entry_debounce"}), 200
 
-        # Safety: if during debounce the final color contradicts action, cancel
         final_color = s.get("pending_entry_color")
         if action == "ENTER_LONG" and final_color != LONG_COLOR:
             print(f"VECTOR ENTRY CANCEL: {symbol} bar_key={bk} action={action} final_color={final_color}")
@@ -548,9 +520,7 @@ def webhook():
             print(f"VECTOR ENTRY CANCEL: {symbol} bar_key={bk} action={action} final_color={final_color}")
             return jsonify({"ok": True, "action": "NONE", "note": "vector_entry_color_flip"}), 200
 
-    # -------------------------
-    # Execute action (ENTRY/EXIT)
-    # -------------------------
+    # Execute action
     if action == "ENTER_LONG":
         bitmart_set_leverage(symbol)
         r = bitmart_open_market(symbol, "LONG")
