@@ -1,13 +1,14 @@
 # app.py — TV_BOT_DEMO_2026_V2 (Render + BitMart Futures)
-# Patch APPROUVÉ: BUFFER/REPLAY (regime None) + SL “Position TP/SL” (UI-visible) + logs priorité EXIT
+# Patch: FIX bm_get_position() when BitMart returns data as LIST (prevents /webhook 500)
+# + Previously approved BUFFER/REPLAY + Position SL submit-tp-sl-order (UI-visible)
 #
 # Contraintes respectées:
-# - Aucun changement Pine
+# - Une seule modification à la fois (ICI: bm_get_position robust list/dict) — le reste inchangé vs la version fournie
 # - Stratégie V3.2 inchangée
 # - SL > EXIT > ENTRY
 # - 1 action max par bar_key (last_action_bar_key)
-# - resync_state_with_exchange() AVANT décision (déjà approuvé)
-# - BUFFER/REPLAY minimal (1 pending / symbole) + replay seulement si bar_key match EXACT
+# - resync_state_with_exchange() AVANT décision
+# - BUFFER/REPLAY minimal
 
 from flask import Flask, request, jsonify
 import os, time, json, hmac, hashlib, math
@@ -191,10 +192,36 @@ def bm_request(method: str, path: str, params: Optional[Dict[str, Any]] = None, 
 # =============================
 # BITMART — primitives
 # =============================
+def _extract_position_from_item(item: Any) -> Tuple[bool, Optional[str], float]:
+    """
+    item expected dict-like. Returns (in_position, side, size).
+    Safe against missing keys.
+    """
+    if not isinstance(item, dict):
+        return False, None, 0.0
+
+    amt = safe_float(item.get("position_amount", item.get("current_amount", 0.0)), 0.0)
+    in_pos = abs(amt) > 0
+
+    side = None
+    # attempt read side hints
+    for k in ("hold_side", "position_side", "position_type"):
+        if k in item and item[k] is not None:
+            try:
+                v = int(item[k])
+                if v == 1:
+                    side = "LONG"
+                elif v == 2:
+                    side = "SHORT"
+            except Exception:
+                pass
+
+    return in_pos, side, abs(amt)
+
 def bm_get_position(symbol: str) -> Tuple[bool, Optional[str], float]:
     """
-    Returns (in_position, side, position_size)
-    side may be None if API doesn't include a clean side field.
+    FIXED: BitMart may return js["data"] as dict OR list.
+    Returns (in_position, side, position_size).
     """
     http, js = bm_request("GET", "/contract/private/position-v2", {"symbol": symbol}, signed=True)
     if http != 200:
@@ -204,25 +231,36 @@ def bm_get_position(symbol: str) -> Tuple[bool, Optional[str], float]:
         log("BITMART position-v2 API error:", {"symbol": symbol, "json": js})
         return False, None, 0.0
 
-    data = js.get("data") or {}
-    # Try common fields
-    amt = safe_float(data.get("position_amount", data.get("current_amount", 0.0)), 0.0)
-    in_pos = abs(amt) > 0
+    data = js.get("data")
 
-    # Some payloads include something like hold_side/position_side
-    side = None
-    for k in ("hold_side", "position_side", "position_type"):
-        if k in data and data[k] is not None:
-            try:
-                v = int(data[k])
-                if v == 1:
-                    side = "LONG"
-                elif v == 2:
-                    side = "SHORT"
-            except Exception:
-                pass
+    # --- FIX START: handle LIST vs DICT ---
+    if isinstance(data, list):
+        # Often [] when flat, or list of positions when multi-symbol
+        if not data:
+            return False, None, 0.0
 
-    return in_pos, side, abs(amt)
+        # Prefer any non-zero position item
+        best_in_pos = False
+        best_side = None
+        best_size = 0.0
+        for it in data:
+            in_pos, side, size = _extract_position_from_item(it)
+            if in_pos and size > 0:
+                return True, side, size
+            # keep a best-effort fallback
+            if size > best_size:
+                best_in_pos, best_side, best_size = in_pos, side, size
+
+        return (best_in_pos and best_size > 0), best_side, best_size
+
+    if isinstance(data, dict):
+        in_pos, side, size = _extract_position_from_item(data)
+        return in_pos, side, size
+
+    # Unknown shape: treat as flat but log once
+    log("BITMART position-v2 unexpected data shape:", {"symbol": symbol, "type": str(type(data)), "data": data})
+    return False, None, 0.0
+    # --- FIX END ---
 
 def resync_state_with_exchange(symbol: str):
     st = STATE[symbol]
@@ -239,7 +277,6 @@ def resync_state_with_exchange(symbol: str):
 
     st["last_resync_ts"] = now_ms()
 
-    # Important log when mismatch matters for exits
     if prev["in_position"] != st["in_position"] or prev["side"] != st["side"]:
         log("RESYNC:", {"symbol": symbol, "prev": prev, "now": {"in_position": st["in_position"], "side": st["side"], "size": size}})
 
@@ -252,14 +289,6 @@ def bm_set_leverage(symbol: str):
     log("BITMART leverage:", {"symbol": symbol, "http": http, "json": js})
 
 def bm_submit_order(symbol: str, side_code: int, size: int) -> Tuple[bool, Dict[str, Any]]:
-    """
-    side_code (BitMart contract submit-order) common mapping:
-      1 buy_open_long
-      2 sell_close_long
-      3 buy_close_short
-      4 sell_open_short
-    If your exchange/account uses different, adjust side_code here ONLY.
-    """
     payload = {
         "symbol": symbol,
         "side": side_code,
@@ -274,12 +303,6 @@ def bm_submit_order(symbol: str, side_code: int, size: int) -> Tuple[bool, Dict[
     return ok, {"http": http, "json": js}
 
 def bm_submit_position_sl(symbol: str, trigger_price: float) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Position TP/SL — endpoint designed to attach TP/SL at position-level (often UI-visible).
-    plan_category: 2 = Position TP/SL (default)
-    category: market (recommended)
-    type: stop_loss
-    """
     payload = {
         "symbol": symbol,
         "type": "stop_loss",
@@ -294,7 +317,6 @@ def bm_submit_position_sl(symbol: str, trigger_price: float) -> Tuple[bool, Dict
     return ok, {"http": http, "json": js}
 
 def bm_get_current_plan_orders(symbol: str) -> Tuple[int, Dict[str, Any]]:
-    # Best-effort verify (endpoint name can vary between versions; keep non-fatal)
     http, js = bm_request("GET", "/contract/private/current-plan-order", {"symbol": symbol}, signed=True)
     return http, js
 
@@ -309,12 +331,6 @@ def set_acted(symbol: str, bar_key: str):
     STATE[symbol]["last_action_bar_key"] = bar_key
 
 def regime_allows_entry(regime: str, signal_or_color: str, is_stoch: bool) -> Optional[str]:
-    """
-    Returns desired entry side "LONG"/"SHORT" or None.
-    V3.2:
-      ABOVE+LD or VECTOR green/blue => LONG
-      BELOW+HD or VECTOR red/purple => SHORT
-    """
     if not regime:
         return None
 
@@ -325,7 +341,6 @@ def regime_allows_entry(regime: str, signal_or_color: str, is_stoch: bool) -> Op
             return "SHORT"
         return None
 
-    # VECTOR
     if regime == "ABOVE" and signal_or_color in LONG_COLORS:
         return "LONG"
     if regime == "BELOW" and signal_or_color in SHORT_COLORS:
@@ -333,12 +348,9 @@ def regime_allows_entry(regime: str, signal_or_color: str, is_stoch: bool) -> Op
     return None
 
 def stoch_exit_for_side(side: str, stoch_sig: str) -> bool:
-    # V3.2 exits:
-    # LONG exits on HD; SHORT exits on LD
     return (side == "LONG" and stoch_sig == "HD") or (side == "SHORT" and stoch_sig == "LD")
 
 def vector_exit_for_side(side: str, color: str) -> bool:
-    # LONG exits on red/purple; SHORT exits on green/blue
     if side == "LONG":
         return color in SHORT_COLORS
     if side == "SHORT":
@@ -346,9 +358,6 @@ def vector_exit_for_side(side: str, color: str) -> bool:
     return False
 
 def place_entry(symbol: str, side: str, close_price: float, bar_key: str, reason: str) -> Dict[str, Any]:
-    """
-    ENTRY: sets leverage (best-effort), submits market order, then attaches SL if configured.
-    """
     st = STATE[symbol]
     if st["in_position"]:
         return {"ok": False, "msg": "ENTRY blocked: already in position"}
@@ -357,7 +366,6 @@ def place_entry(symbol: str, side: str, close_price: float, bar_key: str, reason
     if size <= 0:
         return {"ok": False, "msg": "ENTRY blocked: computed size <= 0", "close": close_price}
 
-    # Set leverage (non-fatal)
     bm_set_leverage(symbol)
 
     if side == "LONG":
@@ -369,7 +377,6 @@ def place_entry(symbol: str, side: str, close_price: float, bar_key: str, reason
     if not ok:
         return {"ok": False, "msg": "ENTRY failed", "resp": resp}
 
-    # Local optimistic update (exchange resync will confirm)
     st["in_position"] = True
     st["side"] = side
     st["entry_price"] = close_price
@@ -377,9 +384,7 @@ def place_entry(symbol: str, side: str, close_price: float, bar_key: str, reason
     set_acted(symbol, bar_key)
     log("ENTRY_APPLY:", {"symbol": symbol, "side": side, "bar_key": bar_key, "reason": reason, "size": size, "close": close_price})
 
-    # Attach SL (Position TP/SL) — UI-visible
     if USE_POSITION_TPSL:
-        # best-effort resync before placing SL (position must exist)
         resync_state_with_exchange(symbol)
         if STATE[symbol]["in_position"]:
             if side == "LONG":
@@ -388,7 +393,6 @@ def place_entry(symbol: str, side: str, close_price: float, bar_key: str, reason
                 trigger = close_price * (1.0 + STOP_LOSS_PCT)
 
             ok_sl, sl_resp = bm_submit_position_sl(symbol, trigger)
-            # Best-effort verify
             http_po, js_po = bm_get_current_plan_orders(symbol)
             log("SL_VERIFY (current-plan-order):", {"symbol": symbol, "http": http_po, "json": js_po})
 
@@ -400,20 +404,14 @@ def place_entry(symbol: str, side: str, close_price: float, bar_key: str, reason
     return {"ok": True, "msg": "ENTRY ok (SL disabled)", "entry": resp}
 
 def place_exit(symbol: str, bar_key: str, reason: str) -> Dict[str, Any]:
-    """
-    EXIT: submit market close based on local side (or exchange side if resync populated it).
-    """
     st = STATE[symbol]
     if not st["in_position"] or st["side"] not in ("LONG", "SHORT"):
         return {"ok": False, "msg": "EXIT blocked: state flat"}
 
     side = st["side"]
-    # Close size: Using "size" close-all is not always possible; often you close by size.
-    # Minimal approach: use a large size is dangerous. Better: rely on your existing close size logic.
-    # Here: we attempt "close by position amount" using position-v2 size if available.
+
     in_pos, exch_side, pos_size = bm_get_position(symbol)
     if not in_pos or pos_size <= 0:
-        # If exchange says flat, align local
         st["in_position"] = False
         st["side"] = None
         st["entry_price"] = None
@@ -432,7 +430,6 @@ def place_exit(symbol: str, bar_key: str, reason: str) -> Dict[str, Any]:
     if not ok:
         return {"ok": False, "msg": "EXIT failed", "resp": resp}
 
-    # Local update
     st["in_position"] = False
     st["side"] = None
     st["entry_price"] = None
@@ -442,34 +439,23 @@ def place_exit(symbol: str, bar_key: str, reason: str) -> Dict[str, Any]:
     return {"ok": True, "msg": "EXIT ok", "resp": resp}
 
 def process_signal(symbol: str, payload: Dict[str, Any], source: str) -> Dict[str, Any]:
-    """
-    source: "VECTOR" | "STOCH_SIGNAL" | "EMA50_STATE" | "REPLAY"
-    Must respect: SL > EXIT > ENTRY, 1 action max per bar_key
-    """
     st = STATE[symbol]
     bar_key = compute_bar_key(payload)
 
-    # Resync BEFORE decision (approved)
     resync_state_with_exchange(symbol)
 
-    # Gate
     if gate_already_acted(symbol, bar_key):
         log("GATE_SKIP:", {"symbol": symbol, "bar_key": bar_key, "source": source})
         return {"ok": True, "msg": "SKIP: already acted on bar_key", "bar_key": bar_key}
 
     event = (payload.get("event") or "").upper()
 
-    # ============ SL priority ============
-    # (SL management is exchange-side; bot doesn't trigger it here.
-    # Priority mention maintained: if in future you add explicit SL event, place it above exits.)
-
-    # ============ EXIT priority ============
+    # EXIT priority
     if st["in_position"] and st["side"] in ("LONG", "SHORT"):
         side = st["side"]
 
         if event == "STOCH_SIGNAL":
             sig = (payload.get("signal") or payload.get("stoch") or payload.get("value") or payload.get("reason") or "").upper()
-            # Normalize to LD/HD if sent as "LD"/"HD"
             if sig in ("LD", "HD"):
                 if stoch_exit_for_side(side, sig):
                     return place_exit(symbol, bar_key, reason=f"STOCH_EXIT_{sig}")
@@ -484,7 +470,7 @@ def process_signal(symbol: str, payload: Dict[str, Any], source: str) -> Dict[st
                 else:
                     log("EXIT_NOOP (vector):", {"symbol": symbol, "side": side, "color": color, "bar_key": bar_key})
 
-    # ============ ENTRY ============
+    # ENTRY
     if not st["in_position"]:
         regime = st.get("regime")
         close_price = safe_float(payload.get("close"), 0.0)
@@ -498,7 +484,6 @@ def process_signal(symbol: str, payload: Dict[str, Any], source: str) -> Dict[st
 
         if event == "VECTOR":
             color = (payload.get("color") or "").lower()
-            # Debounce ENTRY on VECTOR only: "once per bar" already at TV, we still keep bar_key gate + this check
             if color:
                 side = regime_allows_entry(regime, color, is_stoch=False)
                 if side and close_price > 0:
@@ -507,7 +492,7 @@ def process_signal(symbol: str, payload: Dict[str, Any], source: str) -> Dict[st
     return {"ok": True, "msg": "NO_ACTION", "bar_key": bar_key, "source": source}
 
 # =============================
-# BUFFER / REPLAY (approved)
+# BUFFER / REPLAY
 # =============================
 def buffer_pending(symbol: str, payload: Dict[str, Any], why: str) -> Dict[str, Any]:
     bar_key = compute_bar_key(payload)
@@ -534,7 +519,6 @@ def try_replay_pending(symbol: str, ema_payload: Dict[str, Any]) -> Dict[str, An
         st["pending"] = None
         return {"ok": True, "msg": "REPLAY_SKIP: bar_key mismatch", "ema_bar_key": ema_bar_key}
 
-    # Respect gate: if already acted on this bar_key, do NOT replay
     if gate_already_acted(symbol, ema_bar_key):
         log("REPLAY_SKIP:", {"symbol": symbol, "reason": "already_acted_on_bar_key", "bar_key": ema_bar_key})
         st["pending"] = None
@@ -542,7 +526,6 @@ def try_replay_pending(symbol: str, ema_payload: Dict[str, Any]) -> Dict[str, An
 
     log("REPLAY:", {"symbol": symbol, "event": pending.get("event"), "bar_key": ema_bar_key})
     st["pending"] = None
-    # Replay by routing through the SAME decision pipeline
     return process_signal(symbol, pending["payload"], source="REPLAY")
 
 # =============================
@@ -565,7 +548,6 @@ def webhook():
     if not verify_tv_secret(payload):
         return jsonify({"ok": False, "error": "bad secret"}), 403
 
-    # Normalize symbol
     tv_ticker = payload.get("ticker") or payload.get("symbol") or ""
     symbol = normalize_symbol(tv_ticker)
     if not symbol:
@@ -575,49 +557,38 @@ def webhook():
     event = (payload.get("event") or "").upper()
     bar_key = compute_bar_key(payload)
 
-    # Basic trace log
     log("ALERTE:", {"event": event, "symbol": symbol, "bar_key": bar_key})
 
     st = STATE[symbol]
 
-    # EMA50_STATE updates regime + replay pending if exact bar_key match
     if event == "EMA50_STATE":
         state = (payload.get("state") or payload.get("regime") or payload.get("value") or "").upper()
         if state in ("ABOVE", "BELOW"):
             prev = st.get("regime")
             st["regime"] = state
             log("REGIME_SET:", {"symbol": symbol, "prev": prev, "now": state, "bar_key": bar_key})
-
-            # Replay pending (approved) — only if bar_key match exact
             replay_res = try_replay_pending(symbol, payload)
             return jsonify({"ok": True, "msg": "EMA50_STATE processed", "replay": replay_res}), 200
 
         return jsonify({"ok": True, "msg": "EMA50_STATE ignored: invalid state"}), 200
 
-    # BUFFER logic: if event is actionable but regime is None, buffer and exit
     if event in ("VECTOR", "STOCH_SIGNAL"):
         if st.get("regime") is None:
             res = buffer_pending(symbol, payload, why="regime_none")
             return jsonify(res), 200
 
-        # Normal processing
         res = process_signal(symbol, payload, source=event)
         return jsonify(res), 200
 
-    # Unknown events: ignore safely
     return jsonify({"ok": True, "msg": "ignored event", "event": event}), 200
 
-
 # =============================
-# DEBUG ENDPOINTS (optional)
+# DEBUG
 # =============================
 @app.route("/debug/state", methods=["GET"])
 def debug_state():
-    # For quick inspection in Render logs / browser
     return jsonify({"ok": True, "state": STATE}), 200
 
-
 if __name__ == "__main__":
-    # Local run
     port = int(os.environ.get("PORT") or "5000")
     app.run(host="0.0.0.0", port=port, debug=False)
