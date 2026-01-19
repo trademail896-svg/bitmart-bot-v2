@@ -1,9 +1,9 @@
 # app.py — TV_BOT_DEMO_2026_V2 (Render + BitMart Futures)
 # Patch: FIX bm_get_position() when BitMart returns data as LIST (prevents /webhook 500)
-# + Previously approved BUFFER/REPLAY + Position SL submit-tp-sl-order (UI-visible)
+# Patch: EMA50_STATE now triggers resync_state_with_exchange(symbol) BEFORE setting regime (stabilizes state)
 #
 # Contraintes respectées:
-# - Une seule modification à la fois (ICI: bm_get_position robust list/dict) — le reste inchangé vs la version fournie
+# - Une seule modification à la fois (ICI: resync sur EMA50_STATE)
 # - Stratégie V3.2 inchangée
 # - SL > EXIT > ENTRY
 # - 1 action max par bar_key (last_action_bar_key)
@@ -80,12 +80,6 @@ def verify_tv_secret(payload: Dict[str, Any]) -> bool:
 def safe_float(x, default=0.0) -> float:
     try:
         return float(x)
-    except Exception:
-        return default
-
-def safe_int(x, default=0) -> int:
-    try:
-        return int(float(x))
     except Exception:
         return default
 
@@ -204,7 +198,6 @@ def _extract_position_from_item(item: Any) -> Tuple[bool, Optional[str], float]:
     in_pos = abs(amt) > 0
 
     side = None
-    # attempt read side hints
     for k in ("hold_side", "position_side", "position_type"):
         if k in item and item[k] is not None:
             try:
@@ -233,13 +226,10 @@ def bm_get_position(symbol: str) -> Tuple[bool, Optional[str], float]:
 
     data = js.get("data")
 
-    # --- FIX START: handle LIST vs DICT ---
     if isinstance(data, list):
-        # Often [] when flat, or list of positions when multi-symbol
         if not data:
             return False, None, 0.0
 
-        # Prefer any non-zero position item
         best_in_pos = False
         best_side = None
         best_size = 0.0
@@ -247,7 +237,6 @@ def bm_get_position(symbol: str) -> Tuple[bool, Optional[str], float]:
             in_pos, side, size = _extract_position_from_item(it)
             if in_pos and size > 0:
                 return True, side, size
-            # keep a best-effort fallback
             if size > best_size:
                 best_in_pos, best_side, best_size = in_pos, side, size
 
@@ -257,10 +246,8 @@ def bm_get_position(symbol: str) -> Tuple[bool, Optional[str], float]:
         in_pos, side, size = _extract_position_from_item(data)
         return in_pos, side, size
 
-    # Unknown shape: treat as flat but log once
     log("BITMART position-v2 unexpected data shape:", {"symbol": symbol, "type": str(type(data)), "data": data})
     return False, None, 0.0
-    # --- FIX END ---
 
 def resync_state_with_exchange(symbol: str):
     st = STATE[symbol]
@@ -368,10 +355,7 @@ def place_entry(symbol: str, side: str, close_price: float, bar_key: str, reason
 
     bm_set_leverage(symbol)
 
-    if side == "LONG":
-        side_code = 1
-    else:
-        side_code = 4
+    side_code = 1 if side == "LONG" else 4
 
     ok, resp = bm_submit_order(symbol, side_code, size)
     if not ok:
@@ -387,15 +371,10 @@ def place_entry(symbol: str, side: str, close_price: float, bar_key: str, reason
     if USE_POSITION_TPSL:
         resync_state_with_exchange(symbol)
         if STATE[symbol]["in_position"]:
-            if side == "LONG":
-                trigger = close_price * (1.0 - STOP_LOSS_PCT)
-            else:
-                trigger = close_price * (1.0 + STOP_LOSS_PCT)
-
+            trigger = close_price * (1.0 - STOP_LOSS_PCT) if side == "LONG" else close_price * (1.0 + STOP_LOSS_PCT)
             ok_sl, sl_resp = bm_submit_position_sl(symbol, trigger)
             http_po, js_po = bm_get_current_plan_orders(symbol)
             log("SL_VERIFY (current-plan-order):", {"symbol": symbol, "http": http_po, "json": js_po})
-
             return {"ok": True, "msg": "ENTRY ok + SL attempted", "entry": resp, "sl": sl_resp}
         else:
             log("SL_SKIP:", {"symbol": symbol, "reason": "position_not_confirmed_after_entry"})
@@ -421,10 +400,7 @@ def place_exit(symbol: str, bar_key: str, reason: str) -> Dict[str, Any]:
     if size <= 0:
         return {"ok": False, "msg": "EXIT blocked: computed close size <= 0", "pos_size": pos_size}
 
-    if side == "LONG":
-        side_code = 2  # sell_close_long
-    else:
-        side_code = 3  # buy_close_short
+    side_code = 2 if side == "LONG" else 3
 
     ok, resp = bm_submit_order(symbol, side_code, size)
     if not ok:
@@ -562,6 +538,9 @@ def webhook():
     st = STATE[symbol]
 
     if event == "EMA50_STATE":
+        # ✅ PATCH: resync on EMA50_STATE too, so last_resync_ts updates for all symbols and state stays consistent
+        resync_state_with_exchange(symbol)
+
         state = (payload.get("state") or payload.get("regime") or payload.get("value") or "").upper()
         if state in ("ABOVE", "BELOW"):
             prev = st.get("regime")
