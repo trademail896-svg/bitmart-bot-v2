@@ -1,9 +1,10 @@
 # app.py — TV_BOT_DEMO_2026_V2 (Render + BitMart Futures)
-# Patch: FIX bm_get_position() when BitMart returns data as LIST (prevents /webhook 500)
-# Patch: EMA50_STATE now triggers resync_state_with_exchange(symbol) BEFORE setting regime (stabilizes state)
+# Patch 1: FIX bm_get_position() when BitMart returns data as LIST (prevents /webhook 500)
+# Patch 2: EMA50_STATE triggers resync_state_with_exchange(symbol) BEFORE setting regime
+# Patch 3 (THIS CHANGE): POST signature uses compact JSON WITHOUT sort_keys (fix X-BM-SIGN is wrong)
 #
 # Contraintes respectées:
-# - Une seule modification à la fois (ICI: resync sur EMA50_STATE)
+# - Une seule modification à la fois (ICI: _compact_json() sort_keys removed)
 # - Stratégie V3.2 inchangée
 # - SL > EXIT > ENTRY
 # - 1 action max par bar_key (last_action_bar_key)
@@ -38,21 +39,15 @@ BITMART_API_MEMO = (os.environ.get("BITMART_API_MEMO") or "").strip()
 OPEN_TYPE = (os.environ.get("OPEN_TYPE") or "isolated").strip()  # isolated / cross
 LEVERAGE = int(os.environ.get("LEVERAGE") or "25")
 
-# Position sizing (NOTE: BitMart "size" is often CONTRACTS integer.
-# If your existing bot already computes correct "size", plug it here.)
 EST_MARGIN_USD_PER_TRADE = float(os.environ.get("EST_MARGIN_USD_PER_TRADE") or "100")
 NOTIONAL_USD_PER_TRADE = float(os.environ.get("NOTIONAL_USD_PER_TRADE") or str(EST_MARGIN_USD_PER_TRADE * LEVERAGE))
 
-# Stop-loss percentage (WITHOUT leverage) e.g. 0.5% -> 0.005
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT") or "0.005")
 
-# Make SL UI-visible using Position TP/SL endpoint
 USE_POSITION_TPSL = (os.environ.get("USE_POSITION_TPSL") or "true").lower() == "true"
-TPSL_PRICE_TYPE = int(os.environ.get("TPSL_PRICE_TYPE") or "2")  # 1=last, 2=fair/mark (recommended)
-TPSL_CATEGORY = (os.environ.get("TPSL_CATEGORY") or "market").strip()  # "market" recommended
+TPSL_PRICE_TYPE = int(os.environ.get("TPSL_PRICE_TYPE") or "2")
+TPSL_CATEGORY = (os.environ.get("TPSL_CATEGORY") or "market").strip()
 
-# Contract sizing helper (optional)
-# If BitMart requires contracts, you can set CONTRACTS_PER_1_UNIT, e.g. 100, 10, etc. (depends on product spec)
 CONTRACTS_PER_1_UNIT = float(os.environ.get("CONTRACTS_PER_1_UNIT") or "1")
 
 # =============================
@@ -68,7 +63,6 @@ def log(msg: str, obj: Optional[dict] = None):
         print(f"{msg} {obj}", flush=True)
 
 def normalize_symbol(tv_ticker: str) -> Optional[str]:
-    # TradingView peut envoyer BTCUSDT.P
     if not tv_ticker:
         return None
     base = tv_ticker.replace(".P", "").strip().upper()
@@ -84,7 +78,6 @@ def safe_float(x, default=0.0) -> float:
         return default
 
 def compute_bar_key(payload: Dict[str, Any]) -> str:
-    # On utilise le champ bar_key si fourni par Pine, sinon on reconstruit (ticker|tf|time)
     if payload.get("bar_key"):
         return str(payload["bar_key"])
     t = payload.get("ticker") or payload.get("symbol") or "NA"
@@ -93,27 +86,24 @@ def compute_bar_key(payload: Dict[str, Any]) -> str:
     return f"{t}|{tf}|{tm}"
 
 def compute_size_contracts(symbol: str, close_price: float) -> int:
-    # Minimal and deterministic.
-    # If your existing bot has exact BitMart sizing, replace this function body with your known-good logic.
     if close_price <= 0:
         return 0
-    qty_units = NOTIONAL_USD_PER_TRADE / close_price  # units (coin)
+    qty_units = NOTIONAL_USD_PER_TRADE / close_price
     contracts = int(math.floor(qty_units * CONTRACTS_PER_1_UNIT))
     return max(0, contracts)
 
 def round_price(p: float) -> str:
-    # Simple rounding; adjust per symbol tick if needed.
     return f"{p:.2f}"
 
 STATE: Dict[str, Dict[str, Any]] = {
     s: {
         "in_position": False,
-        "side": None,                 # "LONG" / "SHORT"
-        "regime": None,               # "ABOVE" / "BELOW"
-        "last_action_bar_key": None,  # gate 1 action / bar_key
-        "pending": None,              # BUFFER/REPLAY (1 pending / symbole)
+        "side": None,
+        "regime": None,
+        "last_action_bar_key": None,
+        "pending": None,
         "last_resync_ts": 0,
-        "entry_price": None,          # best-effort from alert
+        "entry_price": None,
     }
     for s in ALLOWED_SYMBOLS
 }
@@ -122,7 +112,6 @@ STATE: Dict[str, Dict[str, Any]] = {
 # BITMART — signing + request
 # =============================
 def _sorted_kv_string(params: Dict[str, Any]) -> str:
-    # For GET signing: "k=v&k2=v2" with stable order
     items = []
     for k in sorted(params.keys()):
         v = params[k]
@@ -134,11 +123,11 @@ def _sorted_kv_string(params: Dict[str, Any]) -> str:
     return "&".join(items)
 
 def _compact_json(params: Dict[str, Any]) -> str:
-    # For POST signing: compact json string
-    return json.dumps(params, separators=(",", ":"), sort_keys=True)
+    # IMPORTANT: do NOT sort keys. Signature must match the exact body string sent.
+    # This fixes: 'Header X-BM-SIGN is wrong'
+    return json.dumps(params, separators=(",", ":"))
 
 def _bm_sign(ts_ms: int, qs: str) -> str:
-    # Signature prehash: timestamp + "#" + memo + "#" + queryString
     prehash = f"{ts_ms}#{BITMART_API_MEMO}#{qs}"
     return hmac.new(
         BITMART_API_SECRET.encode("utf-8"),
@@ -187,10 +176,6 @@ def bm_request(method: str, path: str, params: Optional[Dict[str, Any]] = None, 
 # BITMART — primitives
 # =============================
 def _extract_position_from_item(item: Any) -> Tuple[bool, Optional[str], float]:
-    """
-    item expected dict-like. Returns (in_position, side, size).
-    Safe against missing keys.
-    """
     if not isinstance(item, dict):
         return False, None, 0.0
 
@@ -212,10 +197,6 @@ def _extract_position_from_item(item: Any) -> Tuple[bool, Optional[str], float]:
     return in_pos, side, abs(amt)
 
 def bm_get_position(symbol: str) -> Tuple[bool, Optional[str], float]:
-    """
-    FIXED: BitMart may return js["data"] as dict OR list.
-    Returns (in_position, side, position_size).
-    """
     http, js = bm_request("GET", "/contract/private/position-v2", {"symbol": symbol}, signed=True)
     if http != 200:
         log("BITMART position-v2 HTTP error:", {"symbol": symbol, "http": http, "json": js})
@@ -426,7 +407,6 @@ def process_signal(symbol: str, payload: Dict[str, Any], source: str) -> Dict[st
 
     event = (payload.get("event") or "").upper()
 
-    # EXIT priority
     if st["in_position"] and st["side"] in ("LONG", "SHORT"):
         side = st["side"]
 
@@ -446,7 +426,6 @@ def process_signal(symbol: str, payload: Dict[str, Any], source: str) -> Dict[st
                 else:
                     log("EXIT_NOOP (vector):", {"symbol": symbol, "side": side, "color": color, "bar_key": bar_key})
 
-    # ENTRY
     if not st["in_position"]:
         regime = st.get("regime")
         close_price = safe_float(payload.get("close"), 0.0)
@@ -538,7 +517,6 @@ def webhook():
     st = STATE[symbol]
 
     if event == "EMA50_STATE":
-        # ✅ PATCH: resync on EMA50_STATE too, so last_resync_ts updates for all symbols and state stays consistent
         resync_state_with_exchange(symbol)
 
         state = (payload.get("state") or payload.get("regime") or payload.get("value") or "").upper()
