@@ -11,19 +11,15 @@ app = Flask(__name__)
 # =========================
 # CONFIG
 # =========================
-BOT_VERSION = os.environ.get("BOT_VERSION", "TV_BOT_DEMO_2026_V2_time_normalization_dedup_fix").strip()
+BOT_VERSION = os.environ.get(
+    "BOT_VERSION",
+    "TV_BOT_DEMO_2026_V2_B1_stoch_primary_vector_reentry_dedup_fix"
+).strip()
 
 SECRET = (os.environ.get("TV_WEBHOOK_SECRET") or "TV_BOT_DEMO_2026_V2").strip()
 
 # Demo by default (no real orders)
 EXECUTION_ENABLED = (os.environ.get("EXECUTION_ENABLED") or "0").strip() == "1"
-
-# Entry trigger mode:
-# - VECTOR (recommended with your “vector enters” setup)
-# - STOCH  (entries immediately on LD/HD)
-ENTRY_TRIGGER = (os.environ.get("ENTRY_TRIGGER") or "VECTOR").strip().upper()
-if ENTRY_TRIGGER not in ("VECTOR", "STOCH"):
-    ENTRY_TRIGGER = "VECTOR"
 
 ALLOWED_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
@@ -43,8 +39,8 @@ TTL_LOCK_SEC = 60 * 60 * 6           # 6 hours (latch/anti-dup)
 K_EMA50 = "tvbotv2:ema50_state:{sym}"        # "ABOVE"/"BELOW"
 K_BIAS = "tvbotv2:bias:{sym}"               # "LONG"/"SHORT"/None
 K_POS = "tvbotv2:pos:{sym}"                 # json {"in_position":bool,"side":"LONG/SHORT"}
-K_STOCH_LATCH = "tvbotv2:stoch_latch:{sym}" # bar_key_ms string
-K_DEDUP = "tvbotv2:dedup:{sym}:{event}:{bar_key_ms}"  # "1" (idempotency)
+K_STOCH_LATCH = "tvbotv2:stoch_latch:{sym}" # bar_key_ms string (latch per bar)
+K_DEDUP = "tvbotv2:dedup:{sym}:{dedup_id}:{bar_key_ms}"  # "1" (idempotency)
 
 
 # =========================
@@ -60,7 +56,11 @@ def upstash_get(key: str) -> Optional[str]:
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return None
     try:
-        r = requests.get(f"{UPSTASH_REDIS_REST_URL}/get/{key}", headers=_upstash_headers(), timeout=10)
+        r = requests.get(
+            f"{UPSTASH_REDIS_REST_URL}/get/{key}",
+            headers=_upstash_headers(),
+            timeout=10
+        )
         j = r.json()
         return j.get("result", None)
     except Exception:
@@ -85,7 +85,12 @@ def upstash_del(key: str) -> bool:
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return False
     try:
-        r = requests.post(f"{UPSTASH_REDIS_REST_URL}/del", headers=_upstash_headers(), data=json.dumps([key]), timeout=10)
+        r = requests.post(
+            f"{UPSTASH_REDIS_REST_URL}/del",
+            headers=_upstash_headers(),
+            data=json.dumps([key]),
+            timeout=10
+        )
         return r.status_code == 200
     except Exception:
         return False
@@ -175,8 +180,7 @@ def get_pos(sym: str) -> Dict[str, Any]:
     if not raw:
         return {"in_position": False, "side": None}
     try:
-        raw = raw.strip()
-        j = json.loads(raw)
+        j = json.loads(raw.strip())
         if isinstance(j, dict) and "in_position" in j:
             side = j.get("side")
             if isinstance(side, str):
@@ -194,9 +198,7 @@ def get_ema50(sym: str) -> Optional[str]:
     v = upstash_get(K_EMA50.format(sym=sym))
     if isinstance(v, str):
         v = v.strip().upper()
-    if v in ("ABOVE", "BELOW"):
-        return v
-    return None
+    return v if v in ("ABOVE", "BELOW") else None
 
 def set_ema50(sym: str, state: str) -> None:
     state = str(state).strip().upper()
@@ -207,9 +209,7 @@ def get_bias(sym: str) -> Optional[str]:
     v = upstash_get(K_BIAS.format(sym=sym))
     if isinstance(v, str):
         v = v.strip().upper()
-    if v in ("LONG", "SHORT"):
-        return v
-    return None
+    return v if v in ("LONG", "SHORT") else None
 
 def set_bias(sym: str, bias: str) -> None:
     bias = str(bias).strip().upper()
@@ -218,9 +218,7 @@ def set_bias(sym: str, bias: str) -> None:
 
 def get_stoch_latch(sym: str) -> Optional[str]:
     v = upstash_get(K_STOCH_LATCH.format(sym=sym))
-    if isinstance(v, str):
-        return v.strip()
-    return None
+    return v.strip() if isinstance(v, str) else None
 
 def set_stoch_latch(sym: str, bar_key_ms: str) -> None:
     upstash_set(K_STOCH_LATCH.format(sym=sym), str(bar_key_ms).strip(), ex=TTL_LOCK_SEC)
@@ -232,18 +230,17 @@ def clear_stoch_latch(sym: str) -> None:
 # =========================
 # DEDUP (Upstash REST SAFE)
 # =========================
-def dedup_safe(sym: str, event: str, bar_key_ms: str) -> bool:
+def dedup_safe(sym: str, dedup_id: str, bar_key_ms: str) -> bool:
     """
     Returns True if NEW and should be processed.
     Returns False if DUPLICATE (already seen).
 
     Implementation: GET then SET (no NX), safe with Upstash REST.
     """
-    key = K_DEDUP.format(sym=sym, event=event, bar_key_ms=bar_key_ms)
+    key = K_DEDUP.format(sym=sym, dedup_id=dedup_id, bar_key_ms=bar_key_ms)
     existing = upstash_get(key)
     if existing is not None:
         return False
-    # Best-effort set; even if it fails, we still process to avoid blocking critical logic.
     upstash_set(key, "1", ex=TTL_LOCK_SEC)
     return True
 
@@ -259,7 +256,7 @@ def demo_action(action: str, sym: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         "symbol": sym,
         "meta": meta,
         "bot_version": BOT_VERSION,
-        "entry_trigger": ENTRY_TRIGGER,
+        "mode": "B1_STOCH_PRIMARY_VECTOR_REENTRY",
     }
 
 
@@ -272,7 +269,7 @@ def home():
         "ok": True,
         "bot_version": BOT_VERSION,
         "execution_enabled": EXECUTION_ENABLED,
-        "entry_trigger": ENTRY_TRIGGER,
+        "mode": "B1_STOCH_PRIMARY_VECTOR_REENTRY",
         "allowed_symbols": sorted(list(ALLOWED_SYMBOLS)),
         "upstash_configured": bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN),
     }), 200
@@ -306,38 +303,39 @@ def webhook():
     print("ALERTE:", payload)
     print("NORM:", {"sym": sym, "ticker": ticker, "bar_time_ms": bar_time_ms, "bar_key_ms": bar_key_ms})
 
-    # EMA50_STATE must ALWAYS be processed (do not block it with dedup)
-    if event != "EMA50_STATE":
-        if not dedup_safe(sym, event, bar_key_ms):
-            return jsonify({"ok": True, "ignored": True, "reason": "DUPLICATE_EVENT", "bar_key_ms": bar_key_ms, "event": event}), 200
-
+    # Load state
     pos = get_pos(sym)
     ema50 = get_ema50(sym)
     bias = get_bias(sym)
 
     # -------------------------
-    # EMA50_STATE
+    # EMA50_STATE (always process)
     # -------------------------
     if event == "EMA50_STATE":
         state = str(payload.get("state") or "").strip().upper()
         if state not in ("ABOVE", "BELOW"):
             return jsonify({"ok": False, "error": "Invalid EMA50 state"}), 400
+
         set_ema50(sym, state)
-        # Optionally also dedup AFTER writing (not required)
         return jsonify({"ok": True, "event": "EMA50_STATE", "symbol": sym, "state": state, "bar_key_ms": bar_key_ms}), 200
 
     # -------------------------
-    # STOCH_SIGNAL (LD/HD)
-    # - latch per bar: first STOCH wins
-    # - strict filter: ABOVE => accept LD (bias LONG); BELOW => accept HD (bias SHORT)
-    # - entry depends on ENTRY_TRIGGER
+    # STOCH_SIGNAL (LD/HD) — PRIMARY ENTRY
+    # B1:
+    # - Filter strict: ABOVE accepts LD -> bias LONG ; BELOW accepts HD -> bias SHORT
+    # - Entry is triggered immediately by LD/HD when FLAT
+    # - Latch: only first STOCH per bar is taken (prevents LD then HD flip same bar)
     # -------------------------
     if event == "STOCH_SIGNAL":
         reason = str(payload.get("reason") or "").strip().upper()
         if reason not in ("LD", "HD"):
             return jsonify({"ok": False, "error": "Invalid STOCH reason"}), 400
 
-        # Latch: only first STOCH per bar is taken
+        # Dedup per STOCH reason per bar
+        if not dedup_safe(sym, f"STOCH:{reason}", bar_key_ms):
+            return jsonify({"ok": True, "ignored": True, "reason": "DUPLICATE_EVENT", "dedup": f"STOCH:{reason}", "bar_key_ms": bar_key_ms}), 200
+
+        # Latch per bar: first STOCH wins
         latched = get_stoch_latch(sym)
         if latched == bar_key_ms:
             return jsonify({"ok": True, "ignored": True, "reason": "STOCH_LATCHED_THIS_BAR", "bar_key_ms": bar_key_ms}), 200
@@ -348,36 +346,35 @@ def webhook():
             return jsonify({"ok": True, "ignored": True, "reason": "EMA50_UNKNOWN"}), 200
 
         # Apply strict regime mapping
+        new_bias: Optional[str] = None
         if ema50 == "ABOVE" and reason == "LD":
-            set_bias(sym, "LONG")
-            bias = "LONG"
+            new_bias = "LONG"
         elif ema50 == "BELOW" and reason == "HD":
-            set_bias(sym, "SHORT")
-            bias = "SHORT"
+            new_bias = "SHORT"
         else:
             return jsonify({"ok": True, "ignored": True, "reason": "STOCH_BLOCKED_BY_EMA50", "ema50": ema50, "reason_in": reason}), 200
 
-        # Entry if configured to enter on STOCH
-        if ENTRY_TRIGGER == "STOCH":
-            pos = get_pos(sym)
-            if pos.get("in_position"):
-                return jsonify({"ok": True, "ignored": True, "reason": "IN_POSITION_NO_FLIP"}), 200
+        # Persist bias
+        set_bias(sym, new_bias)
+        bias = new_bias
 
+        # PRIMARY ENTRY: enter immediately if FLAT
+        pos = get_pos(sym)
+        if not pos.get("in_position"):
             if bias == "LONG":
                 set_pos(sym, True, "LONG")
-                return jsonify(demo_action("ENTER_LONG", sym, {"trigger": "STOCH_LD", "bar_key_ms": bar_key_ms})), 200
-
+                return jsonify(demo_action("ENTER_LONG", sym, {"trigger": "STOCH_LD_PRIMARY", "ema50": ema50, "bar_key_ms": bar_key_ms})), 200
             if bias == "SHORT":
                 set_pos(sym, True, "SHORT")
-                return jsonify(demo_action("ENTER_SHORT", sym, {"trigger": "STOCH_HD", "bar_key_ms": bar_key_ms})), 200
+                return jsonify(demo_action("ENTER_SHORT", sym, {"trigger": "STOCH_HD_PRIMARY", "ema50": ema50, "bar_key_ms": bar_key_ms})), 200
 
-        # Otherwise STOCH sets bias only
-        return jsonify({"ok": True, "event": "STOCH_SIGNAL", "symbol": sym, "bias": bias, "bar_key_ms": bar_key_ms}), 200
+        # If already in position, we only update bias (no flip here)
+        return jsonify({"ok": True, "event": "STOCH_SIGNAL", "symbol": sym, "bias": bias, "bar_key_ms": bar_key_ms, "note": "Bias updated; already in position"}), 200
 
     # -------------------------
     # VECTOR
-    # - exit immediately on opposite vector
-    # - entry if ENTRY_TRIGGER == VECTOR and (bias matches) and FLAT and EMA50 matches
+    # - Exit immediately on opposite vector (intrabar)
+    # - Re-entry (B1) when FLAT: requires bias already armed AND EMA50 regime matches AND vector side matches
     # -------------------------
     if event == "VECTOR":
         side = str(payload.get("side") or "").strip().upper()   # LONG/SHORT
@@ -385,6 +382,10 @@ def webhook():
 
         if side not in ("LONG", "SHORT"):
             return jsonify({"ok": False, "error": "Invalid VECTOR side"}), 400
+
+        # Dedup per VECTOR side per bar (allows LONG then SHORT in same bar)
+        if not dedup_safe(sym, f"VECTOR:{side}", bar_key_ms):
+            return jsonify({"ok": True, "ignored": True, "reason": "DUPLICATE_EVENT", "dedup": f"VECTOR:{side}", "bar_key_ms": bar_key_ms}), 200
 
         # Optional warnings for color mismatches
         if side == "LONG" and color and color not in LONG_COLORS:
@@ -394,47 +395,50 @@ def webhook():
 
         pos = get_pos(sym)
 
-        # Exit first (immediate)
+        # EXIT FIRST (immediate)
         if pos.get("in_position"):
             current_side = str(pos.get("side") or "").strip().upper()
             if current_side == "LONG" and side == "SHORT":
                 set_pos(sym, False, None)
+                # Do NOT clear bias (needed for re-entry)
                 clear_stoch_latch(sym)
-                return jsonify(demo_action("EXIT_LONG", sym, {"trigger": "OPPOSITE_VECTOR", "bar_key_ms": bar_key_ms})), 200
+                return jsonify(demo_action("EXIT_LONG", sym, {"trigger": "OPPOSITE_VECTOR", "vector_color": color, "bar_key_ms": bar_key_ms})), 200
+
             if current_side == "SHORT" and side == "LONG":
                 set_pos(sym, False, None)
                 clear_stoch_latch(sym)
-                return jsonify(demo_action("EXIT_SHORT", sym, {"trigger": "OPPOSITE_VECTOR", "bar_key_ms": bar_key_ms})), 200
-            return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_NOT_OPPOSITE", "pos": pos, "vector_side": side}), 200
+                return jsonify(demo_action("EXIT_SHORT", sym, {"trigger": "OPPOSITE_VECTOR", "vector_color": color, "bar_key_ms": bar_key_ms})), 200
 
-        # Entry when FLAT
-        if ENTRY_TRIGGER == "VECTOR":
-            ema50 = get_ema50(sym)
-            bias = get_bias(sym)
+            return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_NOT_OPPOSITE", "pos": pos, "vector_side": side, "vector_color": color}), 200
 
-            if ema50 not in ("ABOVE", "BELOW") or bias not in ("LONG", "SHORT"):
-                return jsonify({"ok": True, "ignored": True, "reason": "MISSING_FILTERS", "ema50": ema50, "bias": bias}), 200
+        # FLAT: RE-ENTRY ONLY (B1)
+        ema50 = get_ema50(sym)
+        bias = get_bias(sym)
 
-            # Enforce EMA50 regime
-            if side == "LONG" and ema50 != "ABOVE":
-                return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_LONG_BLOCKED_BY_EMA50", "ema50": ema50}), 200
-            if side == "SHORT" and ema50 != "BELOW":
-                return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_SHORT_BLOCKED_BY_EMA50", "ema50": ema50}), 200
+        if ema50 not in ("ABOVE", "BELOW"):
+            return jsonify({"ok": True, "ignored": True, "reason": "EMA50_UNKNOWN"}), 200
+        if bias not in ("LONG", "SHORT"):
+            return jsonify({"ok": True, "ignored": True, "reason": "BIAS_NOT_ARMED"}), 200
 
-            # Require bias match
-            if side == "LONG" and bias != "LONG":
-                return jsonify({"ok": True, "ignored": True, "reason": "NO_LONG_BIAS"}), 200
-            if side == "SHORT" and bias != "SHORT":
-                return jsonify({"ok": True, "ignored": True, "reason": "NO_SHORT_BIAS"}), 200
+        # Enforce EMA50 regime
+        if side == "LONG" and ema50 != "ABOVE":
+            return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_LONG_BLOCKED_BY_EMA50", "ema50": ema50}), 200
+        if side == "SHORT" and ema50 != "BELOW":
+            return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_SHORT_BLOCKED_BY_EMA50", "ema50": ema50}), 200
 
-            if side == "LONG":
-                set_pos(sym, True, "LONG")
-                return jsonify(demo_action("ENTER_LONG", sym, {"trigger": "VECTOR_LONG", "bar_key_ms": bar_key_ms})), 200
-            else:
-                set_pos(sym, True, "SHORT")
-                return jsonify(demo_action("ENTER_SHORT", sym, {"trigger": "VECTOR_SHORT", "bar_key_ms": bar_key_ms})), 200
+        # Require bias match (B1)
+        if side == "LONG" and bias != "LONG":
+            return jsonify({"ok": True, "ignored": True, "reason": "NO_LONG_BIAS"}), 200
+        if side == "SHORT" and bias != "SHORT":
+            return jsonify({"ok": True, "ignored": True, "reason": "NO_SHORT_BIAS"}), 200
 
-        return jsonify({"ok": True, "ignored": True, "reason": "FLAT_VECTOR_NO_ACTION"}), 200
+        # Execute re-entry
+        if side == "LONG":
+            set_pos(sym, True, "LONG")
+            return jsonify(demo_action("ENTER_LONG", sym, {"trigger": "VECTOR_REENTRY_LONG", "bias": bias, "ema50": ema50, "vector_color": color, "bar_key_ms": bar_key_ms})), 200
+        else:
+            set_pos(sym, True, "SHORT")
+            return jsonify(demo_action("ENTER_SHORT", sym, {"trigger": "VECTOR_REENTRY_SHORT", "bias": bias, "ema50": ema50, "vector_color": color, "bar_key_ms": bar_key_ms})), 200
 
     return jsonify({"ok": True, "ignored": True, "reason": "UNKNOWN_EVENT", "event": event}), 200
 
@@ -462,7 +466,7 @@ def debug_bitmart():
     return jsonify({
         "ok": True,
         "endpoint": "/debug/bitmart",
-        "note": "This build does not execute real BitMart orders unless EXECUTION_ENABLED=1",
+        "note": "This build does not execute real orders unless EXECUTION_ENABLED=1",
         "execution_enabled": EXECUTION_ENABLED,
     }), 200
 
