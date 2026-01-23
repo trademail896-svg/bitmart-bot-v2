@@ -2,7 +2,6 @@
 from flask import Flask, request, jsonify
 import os
 import json
-import time
 import requests
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -12,7 +11,7 @@ app = Flask(__name__)
 # =========================
 # CONFIG
 # =========================
-BOT_VERSION = os.environ.get("BOT_VERSION", "TV_BOT_DEMO_2026_V2_time_normalization").strip()
+BOT_VERSION = os.environ.get("BOT_VERSION", "TV_BOT_DEMO_2026_V2_time_normalization_dedup_fix").strip()
 
 SECRET = (os.environ.get("TV_WEBHOOK_SECRET") or "TV_BOT_DEMO_2026_V2").strip()
 
@@ -72,26 +71,13 @@ def upstash_set(key: str, value: str, ex: int = TTL_STATE_SEC) -> bool:
         return False
     try:
         payload = [key, value, "EX", ex]
-        r = requests.post(f"{UPSTASH_REDIS_REST_URL}/set", headers=_upstash_headers(), data=json.dumps(payload), timeout=10)
+        r = requests.post(
+            f"{UPSTASH_REDIS_REST_URL}/set",
+            headers=_upstash_headers(),
+            data=json.dumps(payload),
+            timeout=10
+        )
         return r.status_code == 200
-    except Exception:
-        return False
-
-def upstash_setnx(key: str, value: str, ex: int = TTL_LOCK_SEC) -> bool:
-    """
-    SET key value NX EX ex
-    Returns True if the key was set (i.e., did not exist).
-    """
-    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
-        return False
-    try:
-        payload = [key, value, "NX", "EX", ex]
-        r = requests.post(f"{UPSTASH_REDIS_REST_URL}/set", headers=_upstash_headers(), data=json.dumps(payload), timeout=10)
-        if r.status_code != 200:
-            return False
-        j = r.json()
-        # Upstash returns result: "OK" when set, null when not set
-        return j.get("result") == "OK"
     except Exception:
         return False
 
@@ -121,11 +107,10 @@ def tf_to_ms(tf: str) -> Optional[int]:
 def parse_time_ms(payload: Dict[str, Any]) -> Optional[int]:
     """
     Accepts:
-      - payload['time_ms'] numeric (preferred)
+      - payload['time_ms'] numeric string/int
       - payload['time'] ISO 'YYYY-MM-DDTHH:MM:SSZ'
     Returns epoch ms int or None.
     """
-    # Prefer numeric time_ms
     if payload.get("time_ms") is not None:
         try:
             v = str(payload["time_ms"]).strip()
@@ -161,8 +146,6 @@ def normalize_symbol(ticker: str) -> str:
 def normalize_bar(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
     """
     Returns: (bar_time_ms, bar_key_ms, ticker, sym)
-    - ticker: raw ticker like 'BTCUSDT.P'
-    - sym: normalized symbol like 'BTCUSDT'
     """
     ticker = str(payload.get("ticker") or "").strip()
     tf = str(payload.get("tf") or "").strip()
@@ -192,56 +175,77 @@ def get_pos(sym: str) -> Dict[str, Any]:
     if not raw:
         return {"in_position": False, "side": None}
     try:
+        raw = raw.strip()
         j = json.loads(raw)
         if isinstance(j, dict) and "in_position" in j:
-            return j
+            side = j.get("side")
+            if isinstance(side, str):
+                side = side.strip().upper()
+            return {"in_position": bool(j.get("in_position")), "side": side}
     except Exception:
         pass
     return {"in_position": False, "side": None}
 
 def set_pos(sym: str, in_position: bool, side: Optional[str]) -> None:
-    upstash_set(K_POS.format(sym=sym), json.dumps({"in_position": in_position, "side": side}), ex=TTL_STATE_SEC)
+    s = side.strip().upper() if isinstance(side, str) else None
+    upstash_set(K_POS.format(sym=sym), json.dumps({"in_position": in_position, "side": s}), ex=TTL_STATE_SEC)
 
 def get_ema50(sym: str) -> Optional[str]:
     v = upstash_get(K_EMA50.format(sym=sym))
+    if isinstance(v, str):
+        v = v.strip().upper()
     if v in ("ABOVE", "BELOW"):
         return v
     return None
 
 def set_ema50(sym: str, state: str) -> None:
+    state = str(state).strip().upper()
     if state in ("ABOVE", "BELOW"):
         upstash_set(K_EMA50.format(sym=sym), state, ex=TTL_STATE_SEC)
 
 def get_bias(sym: str) -> Optional[str]:
     v = upstash_get(K_BIAS.format(sym=sym))
+    if isinstance(v, str):
+        v = v.strip().upper()
     if v in ("LONG", "SHORT"):
         return v
     return None
 
 def set_bias(sym: str, bias: str) -> None:
+    bias = str(bias).strip().upper()
     if bias in ("LONG", "SHORT"):
         upstash_set(K_BIAS.format(sym=sym), bias, ex=TTL_STATE_SEC)
 
 def get_stoch_latch(sym: str) -> Optional[str]:
-    return upstash_get(K_STOCH_LATCH.format(sym=sym))
+    v = upstash_get(K_STOCH_LATCH.format(sym=sym))
+    if isinstance(v, str):
+        return v.strip()
+    return None
 
 def set_stoch_latch(sym: str, bar_key_ms: str) -> None:
-    upstash_set(K_STOCH_LATCH.format(sym=sym), bar_key_ms, ex=TTL_LOCK_SEC)
+    upstash_set(K_STOCH_LATCH.format(sym=sym), str(bar_key_ms).strip(), ex=TTL_LOCK_SEC)
 
 def clear_stoch_latch(sym: str) -> None:
     upstash_del(K_STOCH_LATCH.format(sym=sym))
 
 
 # =========================
-# IDENTITY / DEDUP
+# DEDUP (Upstash REST SAFE)
 # =========================
-def dedup(sym: str, event: str, bar_key_ms: str) -> bool:
+def dedup_safe(sym: str, event: str, bar_key_ms: str) -> bool:
     """
-    Returns True if this (sym,event,bar_key_ms) is NEW and should be processed.
-    Returns False if already processed (duplicate).
+    Returns True if NEW and should be processed.
+    Returns False if DUPLICATE (already seen).
+
+    Implementation: GET then SET (no NX), safe with Upstash REST.
     """
     key = K_DEDUP.format(sym=sym, event=event, bar_key_ms=bar_key_ms)
-    return upstash_setnx(key, "1", ex=TTL_LOCK_SEC)
+    existing = upstash_get(key)
+    if existing is not None:
+        return False
+    # Best-effort set; even if it fails, we still process to avoid blocking critical logic.
+    upstash_set(key, "1", ex=TTL_LOCK_SEC)
+    return True
 
 
 # =========================
@@ -302,9 +306,10 @@ def webhook():
     print("ALERTE:", payload)
     print("NORM:", {"sym": sym, "ticker": ticker, "bar_time_ms": bar_time_ms, "bar_key_ms": bar_key_ms})
 
-    # Idempotency: avoid reprocessing same event on same bar
-    if not dedup(sym, event, bar_key_ms):
-        return jsonify({"ok": True, "ignored": True, "reason": "DUPLICATE_EVENT", "bar_key_ms": bar_key_ms}), 200
+    # EMA50_STATE must ALWAYS be processed (do not block it with dedup)
+    if event != "EMA50_STATE":
+        if not dedup_safe(sym, event, bar_key_ms):
+            return jsonify({"ok": True, "ignored": True, "reason": "DUPLICATE_EVENT", "bar_key_ms": bar_key_ms, "event": event}), 200
 
     pos = get_pos(sym)
     ema50 = get_ema50(sym)
@@ -318,12 +323,13 @@ def webhook():
         if state not in ("ABOVE", "BELOW"):
             return jsonify({"ok": False, "error": "Invalid EMA50 state"}), 400
         set_ema50(sym, state)
+        # Optionally also dedup AFTER writing (not required)
         return jsonify({"ok": True, "event": "EMA50_STATE", "symbol": sym, "state": state, "bar_key_ms": bar_key_ms}), 200
 
     # -------------------------
     # STOCH_SIGNAL (LD/HD)
-    # - latch per bar: first STOCH wins (ignore 'retrait' / opposite within same candle)
-    # - regime filter: ABOVE => LD allowed (bias LONG); BELOW => HD allowed (bias SHORT)
+    # - latch per bar: first STOCH wins
+    # - strict filter: ABOVE => accept LD (bias LONG); BELOW => accept HD (bias SHORT)
     # - entry depends on ENTRY_TRIGGER
     # -------------------------
     if event == "STOCH_SIGNAL":
@@ -337,11 +343,11 @@ def webhook():
             return jsonify({"ok": True, "ignored": True, "reason": "STOCH_LATCHED_THIS_BAR", "bar_key_ms": bar_key_ms}), 200
         set_stoch_latch(sym, bar_key_ms)
 
-        # Need EMA50 known to apply strict filter
+        ema50 = get_ema50(sym)
         if ema50 not in ("ABOVE", "BELOW"):
             return jsonify({"ok": True, "ignored": True, "reason": "EMA50_UNKNOWN"}), 200
 
-        # Apply your strict regime mapping
+        # Apply strict regime mapping
         if ema50 == "ABOVE" and reason == "LD":
             set_bias(sym, "LONG")
             bias = "LONG"
@@ -353,6 +359,7 @@ def webhook():
 
         # Entry if configured to enter on STOCH
         if ENTRY_TRIGGER == "STOCH":
+            pos = get_pos(sym)
             if pos.get("in_position"):
                 return jsonify({"ok": True, "ignored": True, "reason": "IN_POSITION_NO_FLIP"}), 200
 
@@ -364,13 +371,13 @@ def webhook():
                 set_pos(sym, True, "SHORT")
                 return jsonify(demo_action("ENTER_SHORT", sym, {"trigger": "STOCH_HD", "bar_key_ms": bar_key_ms})), 200
 
-        # Otherwise STOCH just sets bias (VECTOR will trigger entry)
+        # Otherwise STOCH sets bias only
         return jsonify({"ok": True, "event": "STOCH_SIGNAL", "symbol": sym, "bias": bias, "bar_key_ms": bar_key_ms}), 200
 
     # -------------------------
     # VECTOR
     # - exit immediately on opposite vector
-    # - entry if ENTRY_TRIGGER == VECTOR and (bias matches) and pos is FLAT and EMA50 matches
+    # - entry if ENTRY_TRIGGER == VECTOR and (bias matches) and FLAT and EMA50 matches
     # -------------------------
     if event == "VECTOR":
         side = str(payload.get("side") or "").strip().upper()   # LONG/SHORT
@@ -379,13 +386,15 @@ def webhook():
         if side not in ("LONG", "SHORT"):
             return jsonify({"ok": False, "error": "Invalid VECTOR side"}), 400
 
-        # Normalize color groups (not mandatory, but helps catch mismatches)
+        # Optional warnings for color mismatches
         if side == "LONG" and color and color not in LONG_COLORS:
             print("WARN: VECTOR LONG color unexpected:", color)
         if side == "SHORT" and color and color not in SHORT_COLORS:
             print("WARN: VECTOR SHORT color unexpected:", color)
 
-        # Exit logic first (immediate)
+        pos = get_pos(sym)
+
+        # Exit first (immediate)
         if pos.get("in_position"):
             current_side = str(pos.get("side") or "").strip().upper()
             if current_side == "LONG" and side == "SHORT":
@@ -398,7 +407,7 @@ def webhook():
                 return jsonify(demo_action("EXIT_SHORT", sym, {"trigger": "OPPOSITE_VECTOR", "bar_key_ms": bar_key_ms})), 200
             return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_NOT_OPPOSITE", "pos": pos, "vector_side": side}), 200
 
-        # Entry (if configured) when FLAT
+        # Entry when FLAT
         if ENTRY_TRIGGER == "VECTOR":
             ema50 = get_ema50(sym)
             bias = get_bias(sym)
@@ -450,11 +459,10 @@ def debug_state(symbol: str):
 
 @app.get("/debug/bitmart")
 def debug_bitmart():
-    # Endpoint kept for compatibility; no secrets exposed.
     return jsonify({
         "ok": True,
         "endpoint": "/debug/bitmart",
-        "note": "This demo build does not execute real BitMart orders unless EXECUTION_ENABLED=1",
+        "note": "This build does not execute real BitMart orders unless EXECUTION_ENABLED=1",
         "execution_enabled": EXECUTION_ENABLED,
     }), 200
 
