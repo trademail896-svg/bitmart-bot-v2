@@ -1,633 +1,464 @@
 # app.py
 from flask import Flask, request, jsonify
 import os
-import time
-import hmac
-import hashlib
 import json
-import math
+import time
 import requests
-from typing import Dict, Any, Optional, Tuple, List
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
 
 app = Flask(__name__)
 
 # =========================
 # CONFIG
 # =========================
-ALLOWED_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
-
-# Vector colors (normalized by your TV alerts)
-LONG_COLOR = "GREEN"
-SHORT_COLOR = "RED"
+BOT_VERSION = os.environ.get("BOT_VERSION", "TV_BOT_DEMO_2026_V2_time_normalization").strip()
 
 SECRET = (os.environ.get("TV_WEBHOOK_SECRET") or "TV_BOT_DEMO_2026_V2").strip()
 
-# BitMart (Futures)
-BITMART_BASE_URL = (os.environ.get("BITMART_BASE_URL") or "").strip()  # e.g. https://api-cloud-v2.bitmart.com or demo-api-cloud-v2...
-BITMART_API_KEY = (os.environ.get("BITMART_API_KEY") or "").strip()
-BITMART_API_SECRET = (os.environ.get("BITMART_API_SECRET") or "").strip()
-BITMART_MEMO = (os.environ.get("BITMART_MEMO") or "").strip()
+# Demo by default (no real orders)
+EXECUTION_ENABLED = (os.environ.get("EXECUTION_ENABLED") or "0").strip() == "1"
 
-# Risk / leverage
-LEVERAGE = int(os.environ.get("BOT_LEVERAGE") or "25")
-OPEN_TYPE = (os.environ.get("BOT_OPEN_TYPE") or "isolated").strip()  # isolated/cross
-NOTIONAL_USD_PER_TRADE = float(os.environ.get("BOT_NOTIONAL_USD_PER_TRADE") or "2500.0")
+# Entry trigger mode:
+# - VECTOR (recommended with your “vector enters” setup)
+# - STOCH  (entries immediately on LD/HD)
+ENTRY_TRIGGER = (os.environ.get("ENTRY_TRIGGER") or "VECTOR").strip().upper()
+if ENTRY_TRIGGER not in ("VECTOR", "STOCH"):
+    ENTRY_TRIGGER = "VECTOR"
 
-# SL config (UNCHANGED)
-SL_PCT = float(os.environ.get("BOT_SL_PCT") or "0.0025")  # 0.25% default (matches your logs)
+ALLOWED_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
-# VECTOR entry debounce (NEW, for buffer stability)
-# Purpose: avoid entering on the first intrabar color if it flips immediately.
-VECTOR_ENTRY_DEBOUNCE_SEC = float(os.environ.get("BOT_VECTOR_ENTRY_DEBOUNCE_SEC") or "3.0")
+# Vector normalization: BLUE==GREEN, PURPLE==RED
+LONG_COLORS = {"GREEN", "BLUE"}
+SHORT_COLORS = {"RED", "PURPLE"}
 
-# Resync toggle (NEW)
-RESYNC_BEFORE_TRADE = (os.environ.get("BOT_RESYNC_BEFORE_TRADE") or "1").strip() == "1"
-
-# Upstash (optional)
+# Upstash (REST)
 UPSTASH_REDIS_REST_URL = (os.environ.get("UPSTASH_REDIS_REST_URL") or "").strip()
 UPSTASH_REDIS_REST_TOKEN = (os.environ.get("UPSTASH_REDIS_REST_TOKEN") or "").strip()
-UPSTASH_PREFIX = (os.environ.get("UPSTASH_PREFIX") or "tvbotv2").strip()
+
+# TTLs
+TTL_STATE_SEC = 60 * 60 * 24 * 7     # 7 days
+TTL_LOCK_SEC = 60 * 60 * 6           # 6 hours (latch/anti-dup)
+
+# Redis keys
+K_EMA50 = "tvbotv2:ema50_state:{sym}"        # "ABOVE"/"BELOW"
+K_BIAS = "tvbotv2:bias:{sym}"               # "LONG"/"SHORT"/None
+K_POS = "tvbotv2:pos:{sym}"                 # json {"in_position":bool,"side":"LONG/SHORT"}
+K_STOCH_LATCH = "tvbotv2:stoch_latch:{sym}" # bar_key_ms string
+K_DEDUP = "tvbotv2:dedup:{sym}:{event}:{bar_key_ms}"  # "1" (idempotency)
+
 
 # =========================
-# STATE (per symbol)
+# UPSTASH HELPERS
 # =========================
-STATE: Dict[str, Dict[str, Any]] = {
-    s: {
-        "in_position": False,
-        "side": None,               # "LONG"/"SHORT"
-        "last_entry_bar_key": None,
-
-        # Regime from EMA50_STATE
-        "regime": None,             # "ABOVE"/"BELOW"/None
-
-        # Bar-key gate: 1 ACTION max per bar_key
-        "last_action_bar_key": None,
-        "last_action_type": None,   # "ENTRY"/"EXIT"/"SL" (debug)
-
-        # (2) Vector buffer (last vector seen for a bar_key)
-        "last_vector_bar_key": None,
-        "last_vector_color": None,   # "GREEN"/"RED"
-        "last_vector_ts": None,      # epoch seconds
-
-        # (2) Pending entry vector debounce window (per bar_key)
-        "pending_entry_bar_key": None,
-        "pending_entry_first_ts": None,
-        "pending_entry_color": None,  # "GREEN"/"RED"
+def _upstash_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
+        "Content-Type": "application/json",
     }
-    for s in ALLOWED_SYMBOLS
-}
 
-# =========================
-# UTILS
-# =========================
-def now_ts() -> float:
-    return time.time()
-
-def normalize_symbol(ticker: str) -> Optional[str]:
-    """
-    TradingView tickers may arrive like BTCUSDT.P; normalize to BTCUSDT.
-    """
-    if not ticker:
-        return None
-    t = ticker.strip().upper()
-    if t.endswith(".P"):
-        t = t[:-2]
-    if ":" in t:
-        t = t.split(":")[-1]
-    if t in ALLOWED_SYMBOLS:
-        return t
-    return None
-
-def upstash_get_bias(symbol: str) -> Optional[str]:
-    """
-    Compatibility: prints existing bias key if Upstash enabled.
-    """
+def upstash_get(key: str) -> Optional[str]:
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return None
-    key = f"{UPSTASH_PREFIX}:bias:{symbol}"
     try:
-        url = f"{UPSTASH_REDIS_REST_URL}/get/{key}"
-        headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
-        r = requests.get(url, headers=headers, timeout=10)
-        js = r.json()
-        val = js.get("result")
-        print(f"UPSTASH GET: {{'symbol': '{symbol}', 'key': '{key}', 'ok': True, 'val': {val!r}, 'dbg': {{'http': {r.status_code}, 'json': {js}}}}}")
-        return val
-    except Exception as e:
-        print(f"UPSTASH GET ERROR: {symbol} -> {e}")
-        return None
-
-def safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
+        r = requests.get(f"{UPSTASH_REDIS_REST_URL}/get/{key}", headers=_upstash_headers(), timeout=10)
+        j = r.json()
+        return j.get("result", None)
     except Exception:
         return None
 
-def bar_key_from_payload(p: Dict[str, Any]) -> Optional[str]:
-    bk = p.get("bar_key")
-    if isinstance(bk, str) and bk.strip():
-        return bk.strip()
-    return None
-
-# =========================
-# BITMART SIGNING / REQUESTS
-# =========================
-def _bitmart_sign(ts_ms: str, method: str, path: str, body: str) -> str:
-    """
-    Common BitMart signature pattern: HMAC_SHA256(secret, ts + method + path + body)
-    """
-    payload = f"{ts_ms}{method.upper()}{path}{body}"
-    return hmac.new(BITMART_API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
-
-def bitmart_request(method: str, path: str, body: Optional[dict] = None) -> Tuple[int, dict]:
-    if not BITMART_BASE_URL:
-        return 500, {"code": -1, "message": "BITMART_BASE_URL missing"}
-    if not BITMART_API_KEY or not BITMART_API_SECRET or not BITMART_MEMO:
-        return 500, {"code": -1, "message": "BitMart API credentials missing"}
-
-    url = BITMART_BASE_URL.rstrip("/") + path
-    ts_ms = str(int(time.time() * 1000))
-    data = body or {}
-    body_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-
-    sign = _bitmart_sign(ts_ms, method, path, body_str)
-    headers = {
-        "Content-Type": "application/json",
-        "X-BM-KEY": BITMART_API_KEY,
-        "X-BM-SIGN": sign,
-        "X-BM-TIMESTAMP": ts_ms,
-        "X-BM-MEMO": BITMART_MEMO,
-    }
-
+def upstash_set(key: str, value: str, ex: int = TTL_STATE_SEC) -> bool:
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return False
     try:
-        if method.upper() == "GET":
-            r = requests.get(url, headers=headers, timeout=15)
-        else:
-            r = requests.request(method.upper(), url, headers=headers, data=body_str, timeout=15)
-        try:
-            js = r.json()
-        except Exception:
-            js = {"code": -3, "message": "non-json response", "text": r.text[:500]}
-        return r.status_code, js
-    except Exception as e:
-        return 500, {"code": -2, "message": f"request error: {e}"}
-
-def bitmart_set_leverage(symbol: str) -> Dict[str, Any]:
-    path = "/contract/private/submit-leverage"
-    body = {"symbol": symbol, "leverage": str(LEVERAGE), "open_type": OPEN_TYPE}
-    http, js = bitmart_request("POST", path, body)
-    print(f"BITMART SUBMIT LEVERAGE: {symbol} {{'http': {http}, 'json': {js}}}")
-    return {"http": http, "json": js}
-
-def _calc_size_from_notional(symbol: str) -> float:
-    # Placeholder sizing
-    return 1.0
-
-def bitmart_open_market(symbol: str, side: str) -> Dict[str, Any]:
-    path = "/contract/private/submit-order"
-    body = {
-        "symbol": symbol,
-        "type": "market",
-        "open_type": OPEN_TYPE,
-        "leverage": str(LEVERAGE),
-        "size": str(_calc_size_from_notional(symbol)),
-        "side": side,  # "LONG"/"SHORT" (keep consistent with your previous implementation)
-    }
-    http, js = bitmart_request("POST", path, body)
-    print(f"BITMART OPEN: {symbol} {side} {{'http': {http}, 'json': {js}}}")
-    return {"http": http, "json": js}
-
-def bitmart_close_market(symbol: str, side: str) -> Dict[str, Any]:
-    path = "/contract/private/submit-order"
-    body = {
-        "symbol": symbol,
-        "type": "market",
-        "open_type": OPEN_TYPE,
-        "leverage": str(LEVERAGE),
-        "size": "0",  # close-all placeholder; keep your proven method if different
-        "side": f"CLOSE_{side}",
-    }
-    http, js = bitmart_request("POST", path, body)
-    print(f"BITMART CLOSE: {symbol} {side} {{'http': {http}, 'json': {js}}}")
-    return {"http": http, "json": js}
-
-def bitmart_set_sl(symbol: str, side: str, entry_price: float) -> Dict[str, Any]:
-    """
-    UNCHANGED behavior (simple % SL + safe min distance + rounding)
-    """
-    proposed = entry_price * (1.0 - SL_PCT) if side == "LONG" else entry_price * (1.0 + SL_PCT)
-
-    # Placeholder min distance (keep your original if you had exchange-derived values)
-    min_dist = max(entry_price * 0.0005, 0.0)
-
-    if side == "LONG":
-        final = min(proposed, entry_price - min_dist)
-        final_rounded = math.floor(final * 10) / 10.0
-    else:
-        final = max(proposed, entry_price + min_dist)
-        final_rounded = math.ceil(final * 10) / 10.0
-
-    print(f"SL SAFE: {symbol} {{'side': '{side}', 'entry_price': {entry_price}, 'proposed': {round(proposed, 5)}, 'min_dist': {round(min_dist, 6)}, 'final': {final_rounded}}}")
-
-    path = "/contract/private/submit-plan-order"
-    body = {
-        "symbol": symbol,
-        "trigger_price": str(final_rounded),
-        "plan_type": "loss_plan",
-        "side": side,
-        "open_type": OPEN_TYPE,
-    }
-    http, js = bitmart_request("POST", path, body)
-    print(f"BITMART SL: {symbol} {side} {{'http': {http}, 'json': {js}}}")
-    return {"http": http, "json": js}
-
-# =========================
-# (3) RESYNC HELPERS
-# =========================
-def _extract_positions_list(js: dict) -> List[dict]:
-    """
-    BitMart returns data as [] or list of position objects in many cases.
-    Be defensive.
-    """
-    data = js.get("data")
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        # sometimes position list nested
-        for k in ("positions", "position", "result"):
-            v = data.get(k)
-            if isinstance(v, list):
-                return v
-    return []
-
-def bitmart_get_position(symbol: str) -> Tuple[bool, Optional[str]]:
-    """
-    Returns: (in_position, side) where side is "LONG"/"SHORT" or None.
-    Uses documented endpoints:
-      - GET /contract/private/position-v2 (KEYED)
-      - fallback GET /contract/private/position
-    """
-    # primary: position-v2 (KEYED)
-    for path in ("/contract/private/position-v2", "/contract/private/position"):
-        http, js = bitmart_request("GET", path, None)
-        if http >= 400:
-            continue
-        if not isinstance(js, dict) or js.get("code") not in (1000, "1000"):
-            continue
-
-        plist = _extract_positions_list(js)
-
-        # If empty => flat
-        if not plist:
-            return False, None
-
-        # Find symbol entry
-        target = None
-        for p in plist:
-            if not isinstance(p, dict):
-                continue
-            psym = (p.get("symbol") or p.get("contract_symbol") or "").upper()
-            if psym == symbol.upper():
-                target = p
-                break
-
-        if not target:
-            # No matching symbol => flat for our symbol
-            return False, None
-
-        # Derive side from common fields
-        # Examples seen in logs: current_amount; sometimes can be negative or separate fields.
-        amt = safe_float(target.get("current_amount") or target.get("position_amt") or target.get("amount"))
-        if amt is not None:
-            if amt > 0:
-                return True, "LONG"
-            if amt < 0:
-                return True, "SHORT"
-
-        side_val = (target.get("side") or target.get("position_side") or "").upper()
-        if side_val in ("LONG", "BUY", "1"):
-            return True, "LONG"
-        if side_val in ("SHORT", "SELL", "2"):
-            return True, "SHORT"
-
-        # Another pattern: "hold_side" or "position_type"
-        hold_side = (target.get("hold_side") or target.get("position_type") or "").upper()
-        if hold_side in ("LONG", "1"):
-            return True, "LONG"
-        if hold_side in ("SHORT", "2"):
-            return True, "SHORT"
-
-        # If we can't determine but entry exists, treat as "in position unknown"
-        return True, None
-
-    # If all failed, don't change state
-    return False, None
-
-def resync_state_with_exchange(symbol: str, s: Dict[str, Any]) -> None:
-    if not RESYNC_BEFORE_TRADE:
-        return
-    try:
-        in_pos, side = bitmart_get_position(symbol)
-        before_in = bool(s.get("in_position"))
-        before_side = s.get("side")
-
-        if not in_pos:
-            if before_in:
-                print(f"RESYNC: {symbol} EXCHANGE=FLAT but STATE=IN({before_side}) -> set FLAT")
-            s["in_position"] = False
-            s["side"] = None
-            return
-
-        # in_pos True
-        if side in ("LONG", "SHORT"):
-            if (not before_in) or (before_side != side):
-                print(f"RESYNC: {symbol} EXCHANGE={side} but STATE=({before_side}) -> set {side}")
-            s["in_position"] = True
-            s["side"] = side
-            return
-
-        # side unknown
-        if not before_in:
-            print(f"RESYNC: {symbol} EXCHANGE=IN_POSITION but side unknown; STATE was FLAT -> set in_position=True (side unchanged)")
-            s["in_position"] = True
-            # keep side as-is (None)
-    except Exception as e:
-        print(f"RESYNC ERROR: {symbol} -> {e}")
-
-# =========================
-# CORE DECISION HELPERS (V3.2)
-# =========================
-def should_exit(s: Dict[str, Any], event: str, payload: Dict[str, Any]) -> Optional[str]:
-    if not s["in_position"] or not s["side"]:
-        return None
-    side = s["side"]
-
-    if event == "VECTOR":
-        color = (payload.get("color") or "").upper()
-        if side == "LONG" and color == SHORT_COLOR:
-            return "EXIT_LONG"
-        if side == "SHORT" and color == LONG_COLOR:
-            return "EXIT_SHORT"
-
-    if event == "STOCH_SIGNAL":
-        sig = (payload.get("signal") or "").upper()
-        if side == "LONG" and sig == "HD":
-            return "EXIT_LONG"
-        if side == "SHORT" and sig == "LD":
-            return "EXIT_SHORT"
-
-    return None
-
-def should_enter(s: Dict[str, Any], event: str, payload: Dict[str, Any]) -> Optional[str]:
-    if s["in_position"]:
-        return None
-
-    regime = s.get("regime")
-    if regime not in ("ABOVE", "BELOW"):
-        return None
-
-    if event == "VECTOR":
-        color = (payload.get("color") or "").upper()
-        if regime == "ABOVE" and color == LONG_COLOR:
-            return "ENTER_LONG"
-        if regime == "BELOW" and color == SHORT_COLOR:
-            return "ENTER_SHORT"
-
-    if event == "STOCH_SIGNAL":
-        sig = (payload.get("signal") or "").upper()
-        if regime == "ABOVE" and sig == "LD":
-            return "ENTER_LONG"
-        if regime == "BELOW" and sig == "HD":
-            return "ENTER_SHORT"
-
-    return None
-
-# =========================
-# (2) VECTOR BUFFER + DEBOUNCE (ENTRY ONLY)
-# =========================
-def update_vector_buffer(s: Dict[str, Any], bar_key: Optional[str], color: str) -> None:
-    s["last_vector_bar_key"] = bar_key
-    s["last_vector_color"] = color
-    s["last_vector_ts"] = now_ts()
-
-def entry_allowed_by_vector_debounce(s: Dict[str, Any], bar_key: Optional[str], color: str) -> bool:
-    """
-    Only used for ENTRY on VECTOR.
-    EXIT stays immediate.
-    """
-    if not bar_key:
-        # no bar_key => cannot debounce reliably; allow
-        return True
-
-    # new bar_key => start debounce window
-    if s.get("pending_entry_bar_key") != bar_key:
-        s["pending_entry_bar_key"] = bar_key
-        s["pending_entry_first_ts"] = now_ts()
-        s["pending_entry_color"] = color
-        print(f"VECTOR ENTRY DEBOUNCE START: bar_key={bar_key} color={color}")
+        payload = [key, value, "EX", ex]
+        r = requests.post(f"{UPSTASH_REDIS_REST_URL}/set", headers=_upstash_headers(), data=json.dumps(payload), timeout=10)
+        return r.status_code == 200
+    except Exception:
         return False
 
-    # same bar_key => update last color and check elapsed
-    s["pending_entry_color"] = color
-    first_ts = float(s.get("pending_entry_first_ts") or now_ts())
-    elapsed = now_ts() - first_ts
-
-    if elapsed >= VECTOR_ENTRY_DEBOUNCE_SEC:
-        print(f"VECTOR ENTRY DEBOUNCE PASS: bar_key={bar_key} elapsed={round(elapsed,2)}s final_color={color}")
-        return True
-
-    print(f"VECTOR ENTRY DEBOUNCE HOLD: bar_key={bar_key} elapsed={round(elapsed,2)}s color={color}")
-    return False
-
-# =========================
-# WEBHOOK
-# =========================
-@app.route("/webhook", methods=["POST"])
-def webhook():
+def upstash_setnx(key: str, value: str, ex: int = TTL_LOCK_SEC) -> bool:
+    """
+    SET key value NX EX ex
+    Returns True if the key was set (i.e., did not exist).
+    """
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return False
     try:
-        payload = request.get_json(force=True, silent=False)
+        payload = [key, value, "NX", "EX", ex]
+        r = requests.post(f"{UPSTASH_REDIS_REST_URL}/set", headers=_upstash_headers(), data=json.dumps(payload), timeout=10)
+        if r.status_code != 200:
+            return False
+        j = r.json()
+        # Upstash returns result: "OK" when set, null when not set
+        return j.get("result") == "OK"
     except Exception:
-        return jsonify({"ok": False, "error": "invalid json"}), 400
+        return False
 
-    if not isinstance(payload, dict):
-        return jsonify({"ok": False, "error": "payload must be object"}), 400
+def upstash_del(key: str) -> bool:
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return False
+    try:
+        r = requests.post(f"{UPSTASH_REDIS_REST_URL}/del", headers=_upstash_headers(), data=json.dumps([key]), timeout=10)
+        return r.status_code == 200
+    except Exception:
+        return False
 
-    print(f"ALERTE: {payload}")
-
-    # Secret check
-    if (payload.get("secret") or "").strip() != SECRET:
-        return jsonify({"ok": False, "error": "bad secret"}), 403
-
-    ticker = payload.get("ticker") or ""
-    symbol = normalize_symbol(ticker)
-    if not symbol:
-        return jsonify({"ok": True, "ignored": "symbol"}), 200
-
-    s = STATE[symbol]
-    event = (payload.get("event") or "").strip().upper()
-    bk = bar_key_from_payload(payload)
-
-    # Compatibility debug
-    upstash_get_bias(symbol)
-
-    # -------------------------
-    # EMA50_STATE updates regime only (no trade action / no gate)
-    # -------------------------
-    if event == "EMA50_STATE":
-        st = (payload.get("state") or "").upper()
-        if st in ("ABOVE", "BELOW"):
-            s["regime"] = st
-        return jsonify({"ok": True, "event": "EMA50_STATE", "regime": s["regime"]}), 200
-
-    # -------------------------
-    # (2) VECTOR BUFFER always updates on VECTOR
-    # -------------------------
-    if event == "VECTOR":
-        color = (payload.get("color") or "").upper()
-        if color in (LONG_COLOR, SHORT_COLOR):
-            update_vector_buffer(s, bk, color)
-
-    # -------------------------
-    # Decide action based on priority: SL > EXIT > ENTRY
-    # (SL events not wired here; keeping original behavior)
-    # -------------------------
-    action: Optional[str] = None
-
-    # EXIT first
-    action = should_exit(s, event, payload)
-
-    # ENTRY second
-    if action is None:
-        action = should_enter(s, event, payload)
-
-    # If no action => do nothing and do NOT set last_action_bar_key
-    if action is None:
-        return jsonify({"ok": True, "action": "NONE"}), 200
-
-    # -------------------------
-    # (3) RESYNC before executing ENTRY/EXIT
-    # -------------------------
-    resync_state_with_exchange(symbol, s)
-
-    # Re-check validity after resync
-    if action in ("EXIT_LONG", "EXIT_SHORT"):
-        if not s["in_position"] or (action == "EXIT_LONG" and s["side"] != "LONG") or (action == "EXIT_SHORT" and s["side"] != "SHORT"):
-            print(f"RESYNC BLOCK EXIT: {symbol} action={action} state_in={s['in_position']} state_side={s['side']}")
-            return jsonify({"ok": True, "action": "NONE", "note": "resync_block_exit"}), 200
-
-    if action in ("ENTER_LONG", "ENTER_SHORT"):
-        if s["in_position"]:
-            print(f"RESYNC BLOCK ENTRY: {symbol} action={action} exchange/state shows in_position")
-            return jsonify({"ok": True, "action": "NONE", "note": "resync_block_entry"}), 200
-
-    # -------------------------
-    # BAR_KEY GATE: 1 ACTION max per bar_key (trade actions only)
-    # -------------------------
-    if bk and s["last_action_bar_key"] == bk:
-        print(f"SKIP_DUPLICATE_BAR_KEY: {symbol} bar_key={bk} incoming_event={event} action={action}")
-        return jsonify({"ok": True, "skipped": "duplicate_bar_key"}), 200
-
-    # -------------------------
-    # (2) ENTRY debounce ONLY for VECTOR-triggered ENTRY
-    # -------------------------
-    if event == "VECTOR" and action in ("ENTER_LONG", "ENTER_SHORT"):
-        color = (payload.get("color") or "").upper()
-        if color in (LONG_COLOR, SHORT_COLOR):
-            if not entry_allowed_by_vector_debounce(s, bk, color):
-                # no trade action executed => do NOT set last_action_bar_key
-                return jsonify({"ok": True, "action": "NONE", "note": "vector_entry_debounce"}), 200
-
-        # Safety: if during debounce the final color contradicts action, cancel
-        final_color = s.get("pending_entry_color")
-        if action == "ENTER_LONG" and final_color != LONG_COLOR:
-            print(f"VECTOR ENTRY CANCEL: {symbol} bar_key={bk} action={action} final_color={final_color}")
-            return jsonify({"ok": True, "action": "NONE", "note": "vector_entry_color_flip"}), 200
-        if action == "ENTER_SHORT" and final_color != SHORT_COLOR:
-            print(f"VECTOR ENTRY CANCEL: {symbol} bar_key={bk} action={action} final_color={final_color}")
-            return jsonify({"ok": True, "action": "NONE", "note": "vector_entry_color_flip"}), 200
-
-    # -------------------------
-    # Execute action (ENTRY/EXIT)
-    # -------------------------
-    if action == "ENTER_LONG":
-        bitmart_set_leverage(symbol)
-        r = bitmart_open_market(symbol, "LONG")
-
-        s["in_position"] = True
-        s["side"] = "LONG"
-        s["last_entry_bar_key"] = bk
-
-        entry_px = safe_float(payload.get("close")) or safe_float(payload.get("open")) or 0.0
-        if entry_px > 0:
-            bitmart_set_sl(symbol, "LONG", entry_px)
-
-        s["last_action_bar_key"] = bk
-        s["last_action_type"] = "ENTRY"
-        return jsonify({"ok": True, "action": "ENTER_LONG", "bitmart": r}), 200
-
-    if action == "ENTER_SHORT":
-        bitmart_set_leverage(symbol)
-        r = bitmart_open_market(symbol, "SHORT")
-
-        s["in_position"] = True
-        s["side"] = "SHORT"
-        s["last_entry_bar_key"] = bk
-
-        entry_px = safe_float(payload.get("close")) or safe_float(payload.get("open")) or 0.0
-        if entry_px > 0:
-            bitmart_set_sl(symbol, "SHORT", entry_px)
-
-        s["last_action_bar_key"] = bk
-        s["last_action_type"] = "ENTRY"
-        return jsonify({"ok": True, "action": "ENTER_SHORT", "bitmart": r}), 200
-
-    if action == "EXIT_LONG":
-        r = bitmart_close_market(symbol, "LONG")
-        s["in_position"] = False
-        s["side"] = None
-        s["last_action_bar_key"] = bk
-        s["last_action_type"] = "EXIT"
-        return jsonify({"ok": True, "action": "EXIT_LONG", "bitmart": r}), 200
-
-    if action == "EXIT_SHORT":
-        r = bitmart_close_market(symbol, "SHORT")
-        s["in_position"] = False
-        s["side"] = None
-        s["last_action_bar_key"] = bk
-        s["last_action_type"] = "EXIT"
-        return jsonify({"ok": True, "action": "EXIT_SHORT", "bitmart": r}), 200
-
-    return jsonify({"ok": True, "action": "NONE"}), 200
 
 # =========================
-# HEALTH
+# TIME NORMALIZATION
 # =========================
-@app.route("/", methods=["GET"])
-def health():
+def tf_to_ms(tf: str) -> Optional[int]:
+    s = str(tf).strip().upper()
+    if s.isdigit():
+        return int(s) * 60_000
+    if s == "D":
+        return 24 * 60 * 60_000
+    if s == "W":
+        return 7 * 24 * 60 * 60_000
+    return None
+
+def parse_time_ms(payload: Dict[str, Any]) -> Optional[int]:
+    """
+    Accepts:
+      - payload['time_ms'] numeric (preferred)
+      - payload['time'] ISO 'YYYY-MM-DDTHH:MM:SSZ'
+    Returns epoch ms int or None.
+    """
+    # Prefer numeric time_ms
+    if payload.get("time_ms") is not None:
+        try:
+            v = str(payload["time_ms"]).strip()
+            if v.isdigit():
+                return int(v)
+        except Exception:
+            pass
+
+    iso = payload.get("time")
+    if isinstance(iso, str) and iso.strip():
+        iso = iso.strip()
+        try:
+            if iso.endswith("Z"):
+                dt = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            else:
+                dt = datetime.fromisoformat(iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return None
+
+    return None
+
+def snap_to_bar(time_ms: int, tf_ms: int) -> int:
+    return (time_ms // tf_ms) * tf_ms
+
+def normalize_symbol(ticker: str) -> str:
+    return str(ticker).strip().upper().replace(".P", "")
+
+def normalize_bar(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
+    """
+    Returns: (bar_time_ms, bar_key_ms, ticker, sym)
+    - ticker: raw ticker like 'BTCUSDT.P'
+    - sym: normalized symbol like 'BTCUSDT'
+    """
+    ticker = str(payload.get("ticker") or "").strip()
+    tf = str(payload.get("tf") or "").strip()
+
+    if not ticker or not tf:
+        return None, None, None, None
+
+    sym = normalize_symbol(ticker)
+    if sym not in ALLOWED_SYMBOLS:
+        return None, None, ticker, sym
+
+    tf_ms = tf_to_ms(tf)
+    t_ms = parse_time_ms(payload)
+    if tf_ms is None or t_ms is None:
+        return None, None, ticker, sym
+
+    bar_time_ms = snap_to_bar(t_ms, tf_ms)
+    bar_key_ms = f"{ticker}|{tf}|{bar_time_ms}"
+    return bar_time_ms, bar_key_ms, ticker, sym
+
+
+# =========================
+# STATE
+# =========================
+def get_pos(sym: str) -> Dict[str, Any]:
+    raw = upstash_get(K_POS.format(sym=sym))
+    if not raw:
+        return {"in_position": False, "side": None}
+    try:
+        j = json.loads(raw)
+        if isinstance(j, dict) and "in_position" in j:
+            return j
+    except Exception:
+        pass
+    return {"in_position": False, "side": None}
+
+def set_pos(sym: str, in_position: bool, side: Optional[str]) -> None:
+    upstash_set(K_POS.format(sym=sym), json.dumps({"in_position": in_position, "side": side}), ex=TTL_STATE_SEC)
+
+def get_ema50(sym: str) -> Optional[str]:
+    v = upstash_get(K_EMA50.format(sym=sym))
+    if v in ("ABOVE", "BELOW"):
+        return v
+    return None
+
+def set_ema50(sym: str, state: str) -> None:
+    if state in ("ABOVE", "BELOW"):
+        upstash_set(K_EMA50.format(sym=sym), state, ex=TTL_STATE_SEC)
+
+def get_bias(sym: str) -> Optional[str]:
+    v = upstash_get(K_BIAS.format(sym=sym))
+    if v in ("LONG", "SHORT"):
+        return v
+    return None
+
+def set_bias(sym: str, bias: str) -> None:
+    if bias in ("LONG", "SHORT"):
+        upstash_set(K_BIAS.format(sym=sym), bias, ex=TTL_STATE_SEC)
+
+def get_stoch_latch(sym: str) -> Optional[str]:
+    return upstash_get(K_STOCH_LATCH.format(sym=sym))
+
+def set_stoch_latch(sym: str, bar_key_ms: str) -> None:
+    upstash_set(K_STOCH_LATCH.format(sym=sym), bar_key_ms, ex=TTL_LOCK_SEC)
+
+def clear_stoch_latch(sym: str) -> None:
+    upstash_del(K_STOCH_LATCH.format(sym=sym))
+
+
+# =========================
+# IDENTITY / DEDUP
+# =========================
+def dedup(sym: str, event: str, bar_key_ms: str) -> bool:
+    """
+    Returns True if this (sym,event,bar_key_ms) is NEW and should be processed.
+    Returns False if already processed (duplicate).
+    """
+    key = K_DEDUP.format(sym=sym, event=event, bar_key_ms=bar_key_ms)
+    return upstash_setnx(key, "1", ex=TTL_LOCK_SEC)
+
+
+# =========================
+# DEMO EXECUTION (no exchange calls)
+# =========================
+def demo_action(action: str, sym: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "demo": not EXECUTION_ENABLED,
+        "action": action,
+        "symbol": sym,
+        "meta": meta,
+        "bot_version": BOT_VERSION,
+        "entry_trigger": ENTRY_TRIGGER,
+    }
+
+
+# =========================
+# ROUTES
+# =========================
+@app.get("/")
+def home():
     return jsonify({
         "ok": True,
-        "bot": "TV_BOT_DEMO_2026_V2",
-        "leverage": LEVERAGE,
-        "open_type": OPEN_TYPE,
-        "vector_entry_debounce_sec": VECTOR_ENTRY_DEBOUNCE_SEC,
-        "resync_before_trade": RESYNC_BEFORE_TRADE,
+        "bot_version": BOT_VERSION,
+        "execution_enabled": EXECUTION_ENABLED,
+        "entry_trigger": ENTRY_TRIGGER,
         "allowed_symbols": sorted(list(ALLOWED_SYMBOLS)),
-        "state": {
-            s: {
-                "in_position": STATE[s]["in_position"],
-                "side": STATE[s]["side"],
-                "regime": STATE[s]["regime"],
-                "last_action_bar_key": STATE[s]["last_action_bar_key"],
-                "last_action_type": STATE[s]["last_action_type"],
-                "last_vector_bar_key": STATE[s]["last_vector_bar_key"],
-                "last_vector_color": STATE[s]["last_vector_color"],
-            }
-            for s in ALLOWED_SYMBOLS
-        }
+        "upstash_configured": bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN),
     }), 200
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT") or "5000"))
 
+@app.post("/webhook")
+def webhook():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "Invalid JSON"}), 400
+
+    # Secret
+    if str(payload.get("secret", "")).strip() != SECRET:
+        return jsonify({"ok": False, "error": "Bad secret"}), 403
+
+    event = str(payload.get("event") or "").strip().upper()
+    if not event:
+        return jsonify({"ok": False, "error": "Missing event"}), 400
+
+    bar_time_ms, bar_key_ms, ticker, sym = normalize_bar(payload)
+    if sym is None or ticker is None:
+        return jsonify({"ok": False, "error": "Missing ticker/tf"}), 400
+
+    if sym not in ALLOWED_SYMBOLS:
+        return jsonify({"ok": True, "ignored": True, "reason": "IGNORED_SYMBOL", "symbol": sym}), 200
+
+    if bar_key_ms is None:
+        return jsonify({"ok": False, "error": "Could not normalize time (need time_ms numeric or time ISO)"}), 400
+
+    # Basic log
+    print("ALERTE:", payload)
+    print("NORM:", {"sym": sym, "ticker": ticker, "bar_time_ms": bar_time_ms, "bar_key_ms": bar_key_ms})
+
+    # Idempotency: avoid reprocessing same event on same bar
+    if not dedup(sym, event, bar_key_ms):
+        return jsonify({"ok": True, "ignored": True, "reason": "DUPLICATE_EVENT", "bar_key_ms": bar_key_ms}), 200
+
+    pos = get_pos(sym)
+    ema50 = get_ema50(sym)
+    bias = get_bias(sym)
+
+    # -------------------------
+    # EMA50_STATE
+    # -------------------------
+    if event == "EMA50_STATE":
+        state = str(payload.get("state") or "").strip().upper()
+        if state not in ("ABOVE", "BELOW"):
+            return jsonify({"ok": False, "error": "Invalid EMA50 state"}), 400
+        set_ema50(sym, state)
+        return jsonify({"ok": True, "event": "EMA50_STATE", "symbol": sym, "state": state, "bar_key_ms": bar_key_ms}), 200
+
+    # -------------------------
+    # STOCH_SIGNAL (LD/HD)
+    # - latch per bar: first STOCH wins (ignore 'retrait' / opposite within same candle)
+    # - regime filter: ABOVE => LD allowed (bias LONG); BELOW => HD allowed (bias SHORT)
+    # - entry depends on ENTRY_TRIGGER
+    # -------------------------
+    if event == "STOCH_SIGNAL":
+        reason = str(payload.get("reason") or "").strip().upper()
+        if reason not in ("LD", "HD"):
+            return jsonify({"ok": False, "error": "Invalid STOCH reason"}), 400
+
+        # Latch: only first STOCH per bar is taken
+        latched = get_stoch_latch(sym)
+        if latched == bar_key_ms:
+            return jsonify({"ok": True, "ignored": True, "reason": "STOCH_LATCHED_THIS_BAR", "bar_key_ms": bar_key_ms}), 200
+        set_stoch_latch(sym, bar_key_ms)
+
+        # Need EMA50 known to apply strict filter
+        if ema50 not in ("ABOVE", "BELOW"):
+            return jsonify({"ok": True, "ignored": True, "reason": "EMA50_UNKNOWN"}), 200
+
+        # Apply your strict regime mapping
+        if ema50 == "ABOVE" and reason == "LD":
+            set_bias(sym, "LONG")
+            bias = "LONG"
+        elif ema50 == "BELOW" and reason == "HD":
+            set_bias(sym, "SHORT")
+            bias = "SHORT"
+        else:
+            return jsonify({"ok": True, "ignored": True, "reason": "STOCH_BLOCKED_BY_EMA50", "ema50": ema50, "reason_in": reason}), 200
+
+        # Entry if configured to enter on STOCH
+        if ENTRY_TRIGGER == "STOCH":
+            if pos.get("in_position"):
+                return jsonify({"ok": True, "ignored": True, "reason": "IN_POSITION_NO_FLIP"}), 200
+
+            if bias == "LONG":
+                set_pos(sym, True, "LONG")
+                return jsonify(demo_action("ENTER_LONG", sym, {"trigger": "STOCH_LD", "bar_key_ms": bar_key_ms})), 200
+
+            if bias == "SHORT":
+                set_pos(sym, True, "SHORT")
+                return jsonify(demo_action("ENTER_SHORT", sym, {"trigger": "STOCH_HD", "bar_key_ms": bar_key_ms})), 200
+
+        # Otherwise STOCH just sets bias (VECTOR will trigger entry)
+        return jsonify({"ok": True, "event": "STOCH_SIGNAL", "symbol": sym, "bias": bias, "bar_key_ms": bar_key_ms}), 200
+
+    # -------------------------
+    # VECTOR
+    # - exit immediately on opposite vector
+    # - entry if ENTRY_TRIGGER == VECTOR and (bias matches) and pos is FLAT and EMA50 matches
+    # -------------------------
+    if event == "VECTOR":
+        side = str(payload.get("side") or "").strip().upper()   # LONG/SHORT
+        color = str(payload.get("color") or "").strip().upper()
+
+        if side not in ("LONG", "SHORT"):
+            return jsonify({"ok": False, "error": "Invalid VECTOR side"}), 400
+
+        # Normalize color groups (not mandatory, but helps catch mismatches)
+        if side == "LONG" and color and color not in LONG_COLORS:
+            print("WARN: VECTOR LONG color unexpected:", color)
+        if side == "SHORT" and color and color not in SHORT_COLORS:
+            print("WARN: VECTOR SHORT color unexpected:", color)
+
+        # Exit logic first (immediate)
+        if pos.get("in_position"):
+            current_side = str(pos.get("side") or "").strip().upper()
+            if current_side == "LONG" and side == "SHORT":
+                set_pos(sym, False, None)
+                clear_stoch_latch(sym)
+                return jsonify(demo_action("EXIT_LONG", sym, {"trigger": "OPPOSITE_VECTOR", "bar_key_ms": bar_key_ms})), 200
+            if current_side == "SHORT" and side == "LONG":
+                set_pos(sym, False, None)
+                clear_stoch_latch(sym)
+                return jsonify(demo_action("EXIT_SHORT", sym, {"trigger": "OPPOSITE_VECTOR", "bar_key_ms": bar_key_ms})), 200
+            return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_NOT_OPPOSITE", "pos": pos, "vector_side": side}), 200
+
+        # Entry (if configured) when FLAT
+        if ENTRY_TRIGGER == "VECTOR":
+            ema50 = get_ema50(sym)
+            bias = get_bias(sym)
+
+            if ema50 not in ("ABOVE", "BELOW") or bias not in ("LONG", "SHORT"):
+                return jsonify({"ok": True, "ignored": True, "reason": "MISSING_FILTERS", "ema50": ema50, "bias": bias}), 200
+
+            # Enforce EMA50 regime
+            if side == "LONG" and ema50 != "ABOVE":
+                return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_LONG_BLOCKED_BY_EMA50", "ema50": ema50}), 200
+            if side == "SHORT" and ema50 != "BELOW":
+                return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_SHORT_BLOCKED_BY_EMA50", "ema50": ema50}), 200
+
+            # Require bias match
+            if side == "LONG" and bias != "LONG":
+                return jsonify({"ok": True, "ignored": True, "reason": "NO_LONG_BIAS"}), 200
+            if side == "SHORT" and bias != "SHORT":
+                return jsonify({"ok": True, "ignored": True, "reason": "NO_SHORT_BIAS"}), 200
+
+            if side == "LONG":
+                set_pos(sym, True, "LONG")
+                return jsonify(demo_action("ENTER_LONG", sym, {"trigger": "VECTOR_LONG", "bar_key_ms": bar_key_ms})), 200
+            else:
+                set_pos(sym, True, "SHORT")
+                return jsonify(demo_action("ENTER_SHORT", sym, {"trigger": "VECTOR_SHORT", "bar_key_ms": bar_key_ms})), 200
+
+        return jsonify({"ok": True, "ignored": True, "reason": "FLAT_VECTOR_NO_ACTION"}), 200
+
+    return jsonify({"ok": True, "ignored": True, "reason": "UNKNOWN_EVENT", "event": event}), 200
+
+
+# =========================
+# DEBUG ENDPOINTS
+# =========================
+@app.get("/debug/state/<symbol>")
+def debug_state(symbol: str):
+    sym = symbol.strip().upper()
+    if sym not in ALLOWED_SYMBOLS:
+        return jsonify({"ok": False, "error": "Unknown symbol"}), 400
+    return jsonify({
+        "ok": True,
+        "endpoint": f"/debug/state/{sym}",
+        "symbol": sym,
+        "ema50_state": get_ema50(sym),
+        "bias": get_bias(sym),
+        "pos": get_pos(sym),
+        "stoch_latch": get_stoch_latch(sym),
+    }), 200
+
+@app.get("/debug/bitmart")
+def debug_bitmart():
+    # Endpoint kept for compatibility; no secrets exposed.
+    return jsonify({
+        "ok": True,
+        "endpoint": "/debug/bitmart",
+        "note": "This demo build does not execute real BitMart orders unless EXECUTION_ENABLED=1",
+        "execution_enabled": EXECUTION_ENABLED,
+    }), 200
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
