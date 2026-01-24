@@ -13,7 +13,7 @@ app = Flask(__name__)
 # =========================
 BOT_VERSION = os.environ.get(
     "BOT_VERSION",
-    "TV_BOT_DEMO_2026_V2_B1_stoch_primary_vector_reentry_dedup_fix"
+    "TV_BOT_DEMO_2026_V2_B1_stoch_flip_safe_with_SL15_reverse_on_SL"
 ).strip()
 
 SECRET = (os.environ.get("TV_WEBHOOK_SECRET") or "TV_BOT_DEMO_2026_V2").strip()
@@ -21,30 +21,34 @@ SECRET = (os.environ.get("TV_WEBHOOK_SECRET") or "TV_BOT_DEMO_2026_V2").strip()
 # Demo by default (no real orders)
 EXECUTION_ENABLED = (os.environ.get("EXECUTION_ENABLED") or "0").strip() == "1"
 
-ALLOWED_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+# Stop loss percent (15% = 0.15). Not tied to leverage.
+SL_PCT = float(os.environ.get("SL_PCT", "0.15").strip())
 
-# Vector normalization: BLUE==GREEN, PURPLE==RED
-LONG_COLORS = {"GREEN", "BLUE"}
-SHORT_COLORS = {"RED", "PURPLE"}
+# Symbols allowed (normalized)
+ALLOWED_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
 # Upstash (REST)
 UPSTASH_REDIS_REST_URL = (os.environ.get("UPSTASH_REDIS_REST_URL") or "").strip()
 UPSTASH_REDIS_REST_TOKEN = (os.environ.get("UPSTASH_REDIS_REST_TOKEN") or "").strip()
 
 # TTLs
-TTL_STATE_SEC = 60 * 60 * 24 * 7     # 7 days
-TTL_LOCK_SEC = 60 * 60 * 6           # 6 hours (latch/anti-dup)
+TTL_STATE_SEC = 60 * 60 * 24 * 7     # 7 days (position)
+TTL_DEDUP_SEC = 60 * 30              # 30 min (dedup per bar)
+TTL_LATCH_SEC = 60 * 30              # 30 min (latch per bar)
+TTL_LOCK_SEC = 12                    # 12 sec (critical section lock)
+TTL_BAR_DONE_SEC = 60 * 30           # 30 min (prevent multiple actions in same bar)
 
 # Redis keys
-K_EMA50 = "tvbotv2:ema50_state:{sym}"        # "ABOVE"/"BELOW"
-K_BIAS = "tvbotv2:bias:{sym}"               # "LONG"/"SHORT"/None
-K_POS = "tvbotv2:pos:{sym}"                 # json {"in_position":bool,"side":"LONG/SHORT"}
-K_STOCH_LATCH = "tvbotv2:stoch_latch:{sym}" # bar_key_ms string (latch per bar)
-K_DEDUP = "tvbotv2:dedup:{sym}:{dedup_id}:{bar_key_ms}"  # "1" (idempotency)
+# Position stores entry_price and sl_price
+K_POS = "tvbotv2:pos:{sym}"  # json {"in_position":bool,"side":"LONG/SHORT","entry_price":float,"sl_price":float}
+K_LOCK = "tvbotv2:lock:{sym}"
+K_STOCH_LATCH = "tvbotv2:stoch_latch:{sym}:{bar_key_ms}"   # "1" (NX)
+K_DEDUP = "tvbotv2:dedup:{sym}:{dedup_id}:{bar_key_ms}"    # "1" (NX)
+K_BAR_DONE = "tvbotv2:bar_done:{sym}:{bar_key_ms}"         # "1" (NX) -> only one trade action per bar
 
 
 # =========================
-# UPSTASH HELPERS
+# UPSTASH HELPERS (COMMAND-BODY SAFE)
 # =========================
 def _upstash_headers() -> Dict[str, str]:
     return {
@@ -52,48 +56,56 @@ def _upstash_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
-def upstash_get(key: str) -> Optional[str]:
+def _upstash_cmd(cmd: list) -> Tuple[Optional[Any], Optional[str]]:
+    """
+    Executes a Redis command through Upstash REST by sending the command in the request body.
+    Returns: (result, error_str)
+    """
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
-        return None
+        return None, "UPSTASH_NOT_CONFIGURED"
     try:
-        r = requests.get(
-            f"{UPSTASH_REDIS_REST_URL}/get/{key}",
+        r = requests.post(
+            UPSTASH_REDIS_REST_URL,
             headers=_upstash_headers(),
+            data=json.dumps(cmd),
             timeout=10
         )
         j = r.json()
-        return j.get("result", None)
-    except Exception:
-        return None
+        if "error" in j and j["error"]:
+            return None, str(j["error"])
+        return j.get("result", None), None
+    except Exception as e:
+        return None, f"UPSTASH_EXCEPTION:{type(e).__name__}"
 
-def upstash_set(key: str, value: str, ex: int = TTL_STATE_SEC) -> bool:
-    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
-        return False
-    try:
-        payload = [key, value, "EX", ex]
-        r = requests.post(
-            f"{UPSTASH_REDIS_REST_URL}/set",
-            headers=_upstash_headers(),
-            data=json.dumps(payload),
-            timeout=10
-        )
-        return r.status_code == 200
-    except Exception:
-        return False
+def upstash_get(key: str) -> Tuple[Optional[str], Optional[str]]:
+    res, err = _upstash_cmd(["GET", key])
+    if err:
+        return None, err
+    if res is None:
+        return None, None
+    return str(res), None
 
-def upstash_del(key: str) -> bool:
-    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
-        return False
-    try:
-        r = requests.post(
-            f"{UPSTASH_REDIS_REST_URL}/del",
-            headers=_upstash_headers(),
-            data=json.dumps([key]),
-            timeout=10
-        )
-        return r.status_code == 200
-    except Exception:
-        return False
+def upstash_set_ex(key: str, value: str, ex: int) -> Tuple[bool, Optional[str]]:
+    res, err = _upstash_cmd(["SET", key, value, "EX", int(ex)])
+    if err:
+        return False, err
+    return res is not None, None
+
+def upstash_set_nx_ex(key: str, value: str, ex: int) -> Tuple[bool, Optional[str]]:
+    """
+    Atomic SET NX EX.
+    Returns True if key was set (NEW), False if key already existed.
+    """
+    res, err = _upstash_cmd(["SET", key, value, "NX", "EX", int(ex)])
+    if err:
+        return False, err
+    return (res == "OK"), None
+
+def upstash_del(key: str) -> Tuple[bool, Optional[str]]:
+    res, err = _upstash_cmd(["DEL", key])
+    if err:
+        return False, err
+    return res is not None, None
 
 
 # =========================
@@ -112,7 +124,7 @@ def tf_to_ms(tf: str) -> Optional[int]:
 def parse_time_ms(payload: Dict[str, Any]) -> Optional[int]:
     """
     Accepts:
-      - payload['time_ms'] numeric string/int
+      - payload['time_ms'] numeric string/int (epoch ms)
       - payload['time'] ISO 'YYYY-MM-DDTHH:MM:SSZ'
     Returns epoch ms int or None.
     """
@@ -139,7 +151,6 @@ def parse_time_ms(payload: Dict[str, Any]) -> Optional[int]:
             return int(dt.timestamp() * 1000)
         except Exception:
             return None
-
     return None
 
 def snap_to_bar(time_ms: int, tf_ms: int) -> int:
@@ -150,114 +161,193 @@ def normalize_symbol(ticker: str) -> str:
 
 def normalize_bar(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
     """
-    Returns: (bar_time_ms, bar_key_ms, ticker, sym)
+    Returns: (bar_time_ms, bar_key_ms, ticker_raw, sym)
+    bar_key_ms is canonicalized on sym to avoid .P mismatch issues.
     """
-    ticker = str(payload.get("ticker") or "").strip()
+    ticker_raw = str(payload.get("ticker") or "").strip().upper()
     tf = str(payload.get("tf") or "").strip()
 
-    if not ticker or not tf:
+    if not ticker_raw or not tf:
         return None, None, None, None
 
-    sym = normalize_symbol(ticker)
-    if sym not in ALLOWED_SYMBOLS:
-        return None, None, ticker, sym
+    sym = normalize_symbol(ticker_raw)
 
     tf_ms = tf_to_ms(tf)
     t_ms = parse_time_ms(payload)
     if tf_ms is None or t_ms is None:
-        return None, None, ticker, sym
+        return None, None, ticker_raw, sym
 
     bar_time_ms = snap_to_bar(t_ms, tf_ms)
-    bar_key_ms = f"{ticker}|{tf}|{bar_time_ms}"
-    return bar_time_ms, bar_key_ms, ticker, sym
+    bar_key_ms = f"{sym}|{tf}|{bar_time_ms}"
+    return bar_time_ms, bar_key_ms, ticker_raw, sym
 
 
 # =========================
-# STATE
+# PRICE HELPERS
 # =========================
-def get_pos(sym: str) -> Dict[str, Any]:
-    raw = upstash_get(K_POS.format(sym=sym))
+def _to_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        s = str(v).strip()
+        if not s:
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+def calc_sl(side: str, entry_price: float) -> float:
+    side = str(side).strip().upper()
+    if side == "LONG":
+        return entry_price * (1.0 - SL_PCT)
+    return entry_price * (1.0 + SL_PCT)
+
+
+# =========================
+# STATE (POSITION)
+# =========================
+def get_pos(sym: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    raw, err = upstash_get(K_POS.format(sym=sym))
+    if err:
+        return {"in_position": False, "side": None, "entry_price": None, "sl_price": None}, err
     if not raw:
-        return {"in_position": False, "side": None}
+        return {"in_position": False, "side": None, "entry_price": None, "sl_price": None}, None
     try:
         j = json.loads(raw.strip())
         if isinstance(j, dict) and "in_position" in j:
             side = j.get("side")
             if isinstance(side, str):
                 side = side.strip().upper()
-            return {"in_position": bool(j.get("in_position")), "side": side}
+            if side not in ("LONG", "SHORT"):
+                side = None
+            entry_price = _to_float(j.get("entry_price"))
+            sl_price = _to_float(j.get("sl_price"))
+            return {
+                "in_position": bool(j.get("in_position")),
+                "side": side,
+                "entry_price": entry_price,
+                "sl_price": sl_price,
+            }, None
     except Exception:
         pass
-    return {"in_position": False, "side": None}
+    return {"in_position": False, "side": None, "entry_price": None, "sl_price": None}, None
 
-def set_pos(sym: str, in_position: bool, side: Optional[str]) -> None:
+def set_pos(sym: str, in_position: bool, side: Optional[str], entry_price: Optional[float], sl_price: Optional[float]) -> Tuple[bool, Optional[str]]:
     s = side.strip().upper() if isinstance(side, str) else None
-    upstash_set(K_POS.format(sym=sym), json.dumps({"in_position": in_position, "side": s}), ex=TTL_STATE_SEC)
+    if s not in ("LONG", "SHORT"):
+        s = None
+    payload = {
+        "in_position": bool(in_position),
+        "side": s,
+        "entry_price": float(entry_price) if entry_price is not None else None,
+        "sl_price": float(sl_price) if sl_price is not None else None,
+    }
+    ok, err = upstash_set_ex(K_POS.format(sym=sym), json.dumps(payload), ex=TTL_STATE_SEC)
+    return ok, err
 
-def get_ema50(sym: str) -> Optional[str]:
-    v = upstash_get(K_EMA50.format(sym=sym))
-    if isinstance(v, str):
-        v = v.strip().upper()
-    return v if v in ("ABOVE", "BELOW") else None
-
-def set_ema50(sym: str, state: str) -> None:
-    state = str(state).strip().upper()
-    if state in ("ABOVE", "BELOW"):
-        upstash_set(K_EMA50.format(sym=sym), state, ex=TTL_STATE_SEC)
-
-def get_bias(sym: str) -> Optional[str]:
-    v = upstash_get(K_BIAS.format(sym=sym))
-    if isinstance(v, str):
-        v = v.strip().upper()
-    return v if v in ("LONG", "SHORT") else None
-
-def set_bias(sym: str, bias: str) -> None:
-    bias = str(bias).strip().upper()
-    if bias in ("LONG", "SHORT"):
-        upstash_set(K_BIAS.format(sym=sym), bias, ex=TTL_STATE_SEC)
-
-def get_stoch_latch(sym: str) -> Optional[str]:
-    v = upstash_get(K_STOCH_LATCH.format(sym=sym))
-    return v.strip() if isinstance(v, str) else None
-
-def set_stoch_latch(sym: str, bar_key_ms: str) -> None:
-    upstash_set(K_STOCH_LATCH.format(sym=sym), str(bar_key_ms).strip(), ex=TTL_LOCK_SEC)
-
-def clear_stoch_latch(sym: str) -> None:
-    upstash_del(K_STOCH_LATCH.format(sym=sym))
+def flat_pos(sym: str) -> Tuple[bool, Optional[str]]:
+    return set_pos(sym, False, None, None, None)
 
 
 # =========================
-# DEDUP (Upstash REST SAFE)
+# SAFETY: LOCK / DEDUP / LATCH / BAR_DONE
 # =========================
-def dedup_safe(sym: str, dedup_id: str, bar_key_ms: str) -> bool:
-    """
-    Returns True if NEW and should be processed.
-    Returns False if DUPLICATE (already seen).
+def acquire_lock(sym: str) -> Tuple[bool, Optional[str]]:
+    return upstash_set_nx_ex(K_LOCK.format(sym=sym), "1", ex=TTL_LOCK_SEC)
 
-    Implementation: GET then SET (no NX), safe with Upstash REST.
-    """
+def release_lock(sym: str) -> None:
+    upstash_del(K_LOCK.format(sym=sym))
+
+def dedup_event(sym: str, dedup_id: str, bar_key_ms: str) -> Tuple[bool, Optional[str]]:
     key = K_DEDUP.format(sym=sym, dedup_id=dedup_id, bar_key_ms=bar_key_ms)
-    existing = upstash_get(key)
-    if existing is not None:
-        return False
-    upstash_set(key, "1", ex=TTL_LOCK_SEC)
-    return True
+    return upstash_set_nx_ex(key, "1", ex=TTL_DEDUP_SEC)
+
+def stoch_latch(sym: str, bar_key_ms: str) -> Tuple[bool, Optional[str]]:
+    key = K_STOCH_LATCH.format(sym=sym, bar_key_ms=bar_key_ms)
+    return upstash_set_nx_ex(key, "1", ex=TTL_LATCH_SEC)
+
+def claim_bar_done(sym: str, bar_key_ms: str) -> Tuple[bool, Optional[str]]:
+    """
+    Ensures only ONE trade action (enter/exit/flip) can happen per symbol per bar.
+    Atomic: SET NX EX.
+    """
+    key = K_BAR_DONE.format(sym=sym, bar_key_ms=bar_key_ms)
+    return upstash_set_nx_ex(key, "1", ex=TTL_BAR_DONE_SEC)
 
 
 # =========================
 # DEMO EXECUTION (no exchange calls)
 # =========================
-def demo_action(action: str, sym: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+def demo_actions(actions: list, sym: str, meta: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "ok": True,
         "demo": not EXECUTION_ENABLED,
-        "action": action,
+        "actions": actions,
         "symbol": sym,
         "meta": meta,
         "bot_version": BOT_VERSION,
-        "mode": "B1_STOCH_PRIMARY_VECTOR_REENTRY",
+        "mode": "B1_STOCH_FLIP_SAFE_WITH_SL_REVERSE",
+        "sl_pct": SL_PCT,
     }
+
+
+# =========================
+# CORE: STOP LOSS CHECK + REVERSE
+# =========================
+def sl_hit(side: str, sl_price: float, bar_high: float, bar_low: float) -> bool:
+    side = str(side).strip().upper()
+    if side == "LONG":
+        return bar_low <= sl_price
+    return bar_high >= sl_price  # SHORT
+
+def opposite_side(side: str) -> str:
+    return "SHORT" if str(side).strip().upper() == "LONG" else "LONG"
+
+def handle_sl_reverse(sym: str, side: str, entry_price: Optional[float], sl_price: float,
+                      bar_high: float, bar_low: float, bar_close: Optional[float],
+                      bar_key_ms: str, ticker_raw: str) -> Tuple[Dict[str, Any], int]:
+    """
+    If SL hit: EXIT current side + ENTER opposite side immediately.
+    Uses bar_close for new entry if available; otherwise falls back to sl_price.
+    """
+    new_side = opposite_side(side)
+    new_entry = bar_close if bar_close is not None else sl_price
+    new_sl = calc_sl(new_side, new_entry)
+
+    # Only one action per bar
+    ok, err = claim_bar_done(sym, bar_key_ms)
+    if err:
+        return ({"ok": False, "error": "Upstash error (bar_done)", "detail": err}, 503)
+    if not ok:
+        return ({
+            "ok": True,
+            "ignored": True,
+            "reason": "BAR_ALREADY_ACTED",
+            "symbol": sym,
+            "bar_key_ms": bar_key_ms
+        }, 200)
+
+    # Persist new position (reversed)
+    ok, err = set_pos(sym, True, new_side, new_entry, new_sl)
+    if err:
+        return ({"ok": False, "error": "Upstash error (set_pos)", "detail": err}, 503)
+
+    actions = [f"EXIT_{side}", f"ENTER_{new_side}"]
+    meta = {
+        "trigger": "STOP_LOSS_REVERSE",
+        "from": side,
+        "to": new_side,
+        "prev_entry_price": entry_price,
+        "prev_sl_price": sl_price,
+        "bar_high": bar_high,
+        "bar_low": bar_low,
+        "bar_close_used": new_entry,
+        "new_entry_price": new_entry,
+        "new_sl_price": new_sl,
+        "bar_key_ms": bar_key_ms,
+        "ticker": ticker_raw,
+    }
+    return (demo_actions(actions, sym, meta), 200)
 
 
 # =========================
@@ -269,8 +359,9 @@ def home():
         "ok": True,
         "bot_version": BOT_VERSION,
         "execution_enabled": EXECUTION_ENABLED,
-        "mode": "B1_STOCH_PRIMARY_VECTOR_REENTRY",
+        "mode": "B1_STOCH_FLIP_SAFE_WITH_SL_REVERSE",
         "allowed_symbols": sorted(list(ALLOWED_SYMBOLS)),
+        "sl_pct": SL_PCT,
         "upstash_configured": bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN),
     }), 200
 
@@ -289,158 +380,271 @@ def webhook():
     if not event:
         return jsonify({"ok": False, "error": "Missing event"}), 400
 
-    bar_time_ms, bar_key_ms, ticker, sym = normalize_bar(payload)
-    if sym is None or ticker is None:
+    bar_time_ms, bar_key_ms, ticker_raw, sym = normalize_bar(payload)
+    if sym is None or ticker_raw is None:
         return jsonify({"ok": False, "error": "Missing ticker/tf"}), 400
 
     if sym not in ALLOWED_SYMBOLS:
-        return jsonify({"ok": True, "ignored": True, "reason": "IGNORED_SYMBOL", "symbol": sym}), 200
+        return jsonify({"ok": True, "ignored": True, "reason": "IGNORED_SYMBOL", "symbol": sym, "ticker": ticker_raw}), 200
 
     if bar_key_ms is None:
         return jsonify({"ok": False, "error": "Could not normalize time (need time_ms numeric or time ISO)"}), 400
 
     # Basic log
     print("ALERTE:", payload)
-    print("NORM:", {"sym": sym, "ticker": ticker, "bar_time_ms": bar_time_ms, "bar_key_ms": bar_key_ms})
+    print("NORM:", {"sym": sym, "ticker": ticker_raw, "bar_time_ms": bar_time_ms, "bar_key_ms": bar_key_ms, "event": event})
 
-    # Load state
-    pos = get_pos(sym)
-    ema50 = get_ema50(sym)
-    bias = get_bias(sym)
+    # Allowed events
+    if event not in ("STOCH_SIGNAL", "BAR_CLOSE"):
+        return jsonify({"ok": True, "ignored": True, "reason": "UNKNOWN_EVENT", "event": event}), 200
 
-    # -------------------------
-    # EMA50_STATE (always process)
-    # -------------------------
-    if event == "EMA50_STATE":
-        state = str(payload.get("state") or "").strip().upper()
-        if state not in ("ABOVE", "BELOW"):
-            return jsonify({"ok": False, "error": "Invalid EMA50 state"}), 400
-
-        set_ema50(sym, state)
-        return jsonify({"ok": True, "event": "EMA50_STATE", "symbol": sym, "state": state, "bar_key_ms": bar_key_ms}), 200
-
-    # -------------------------
-    # STOCH_SIGNAL (LD/HD) — PRIMARY ENTRY
-    # B1:
-    # - Filter strict: ABOVE accepts LD -> bias LONG ; BELOW accepts HD -> bias SHORT
-    # - Entry is triggered immediately by LD/HD when FLAT
-    # - Latch: only first STOCH per bar is taken (prevents LD then HD flip same bar)
-    # -------------------------
+    # =========================
+    # DEDUP + (STOCH) LATCH
+    # =========================
     if event == "STOCH_SIGNAL":
         reason = str(payload.get("reason") or "").strip().upper()
         if reason not in ("LD", "HD"):
             return jsonify({"ok": False, "error": "Invalid STOCH reason"}), 400
 
-        # Dedup per STOCH reason per bar
-        if not dedup_safe(sym, f"STOCH:{reason}", bar_key_ms):
+        is_new, err = dedup_event(sym, f"STOCH:{reason}", bar_key_ms)
+        if err:
+            return jsonify({"ok": False, "error": "Upstash error (dedup)", "detail": err}), 503
+        if not is_new:
             return jsonify({"ok": True, "ignored": True, "reason": "DUPLICATE_EVENT", "dedup": f"STOCH:{reason}", "bar_key_ms": bar_key_ms}), 200
 
-        # Latch per bar: first STOCH wins
-        latched = get_stoch_latch(sym)
-        if latched == bar_key_ms:
+        first, err = stoch_latch(sym, bar_key_ms)
+        if err:
+            return jsonify({"ok": False, "error": "Upstash error (latch)", "detail": err}), 503
+        if not first:
             return jsonify({"ok": True, "ignored": True, "reason": "STOCH_LATCHED_THIS_BAR", "bar_key_ms": bar_key_ms}), 200
-        set_stoch_latch(sym, bar_key_ms)
 
-        ema50 = get_ema50(sym)
-        if ema50 not in ("ABOVE", "BELOW"):
-            return jsonify({"ok": True, "ignored": True, "reason": "EMA50_UNKNOWN"}), 200
+    else:
+        is_new, err = dedup_event(sym, "BAR_CLOSE", bar_key_ms)
+        if err:
+            return jsonify({"ok": False, "error": "Upstash error (dedup)", "detail": err}), 503
+        if not is_new:
+            return jsonify({"ok": True, "ignored": True, "reason": "DUPLICATE_EVENT", "dedup": "BAR_CLOSE", "bar_key_ms": bar_key_ms}), 200
 
-        # Apply strict regime mapping
-        new_bias: Optional[str] = None
-        if ema50 == "ABOVE" and reason == "LD":
-            new_bias = "LONG"
-        elif ema50 == "BELOW" and reason == "HD":
-            new_bias = "SHORT"
-        else:
-            return jsonify({"ok": True, "ignored": True, "reason": "STOCH_BLOCKED_BY_EMA50", "ema50": ema50, "reason_in": reason}), 200
+    # =========================
+    # LOCK per symbol
+    # =========================
+    locked, err = acquire_lock(sym)
+    if err:
+        return jsonify({"ok": False, "error": "Upstash error (lock)", "detail": err}), 503
+    if not locked:
+        return jsonify({"ok": True, "ignored": True, "reason": "SYMBOL_BUSY_LOCKED", "symbol": sym}), 200
 
-        # Persist bias
-        set_bias(sym, new_bias)
-        bias = new_bias
+    try:
+        # Load position
+        pos, err = get_pos(sym)
+        if err:
+            return jsonify({"ok": False, "error": "Upstash error (get_pos)", "detail": err}), 503
 
-        # PRIMARY ENTRY: enter immediately if FLAT
-        pos = get_pos(sym)
-        if not pos.get("in_position"):
-            if bias == "LONG":
-                set_pos(sym, True, "LONG")
-                return jsonify(demo_action("ENTER_LONG", sym, {"trigger": "STOCH_LD_PRIMARY", "ema50": ema50, "bar_key_ms": bar_key_ms})), 200
-            if bias == "SHORT":
-                set_pos(sym, True, "SHORT")
-                return jsonify(demo_action("ENTER_SHORT", sym, {"trigger": "STOCH_HD_PRIMARY", "ema50": ema50, "bar_key_ms": bar_key_ms})), 200
+        in_pos = bool(pos.get("in_position"))
+        side = str(pos.get("side") or "").strip().upper() if pos.get("side") else None
+        entry_price = _to_float(pos.get("entry_price"))
+        sl_price = _to_float(pos.get("sl_price"))
 
-        # If already in position, we only update bias (no flip here)
-        return jsonify({"ok": True, "event": "STOCH_SIGNAL", "symbol": sym, "bias": bias, "bar_key_ms": bar_key_ms, "note": "Bias updated; already in position"}), 200
+        # Read prices from payload (support both events)
+        bar_high = _to_float(payload.get("high"))
+        bar_low = _to_float(payload.get("low"))
+        bar_close = _to_float(payload.get("close"))
 
-    # -------------------------
-    # VECTOR
-    # - Exit immediately on opposite vector (intrabar)
-    # - Re-entry (B1) when FLAT: requires bias already armed AND EMA50 regime matches AND vector side matches
-    # -------------------------
-    if event == "VECTOR":
-        side = str(payload.get("side") or "").strip().upper()   # LONG/SHORT
-        color = str(payload.get("color") or "").strip().upper()
+        # ==========================================================
+        # 1) STOP LOSS PRIORITY (ON ANY EVENT IF high/low PRESENT)
+        #    - If SL hit: reverse immediately (exit + enter opposite).
+        #    - This is critical for "once per bar" because order of webhooks is not guaranteed.
+        # ==========================================================
+        if in_pos and side in ("LONG", "SHORT") and sl_price is not None:
+            if bar_high is not None and bar_low is not None:
+                if sl_hit(side, sl_price, bar_high, bar_low):
+                    resp, code = handle_sl_reverse(
+                        sym=sym,
+                        side=side,
+                        entry_price=entry_price,
+                        sl_price=sl_price,
+                        bar_high=bar_high,
+                        bar_low=bar_low,
+                        bar_close=bar_close,
+                        bar_key_ms=bar_key_ms,
+                        ticker_raw=ticker_raw,
+                    )
+                    return jsonify(resp), code
 
-        if side not in ("LONG", "SHORT"):
-            return jsonify({"ok": False, "error": "Invalid VECTOR side"}), 400
+        # If BAR_CLOSE but no SL hit (or missing high/low), do nothing else on BAR_CLOSE
+        if event == "BAR_CLOSE":
+            if not in_pos or side not in ("LONG", "SHORT") or sl_price is None:
+                return jsonify({
+                    "ok": True,
+                    "ignored": True,
+                    "reason": "NO_POSITION_OR_NO_SL",
+                    "symbol": sym,
+                    "bar_key_ms": bar_key_ms,
+                }), 200
+            if bar_high is None or bar_low is None:
+                return jsonify({
+                    "ok": True,
+                    "ignored": True,
+                    "reason": "MISSING_HIGH_LOW_FOR_SL",
+                    "symbol": sym,
+                    "bar_key_ms": bar_key_ms,
+                }), 200
+            return jsonify({
+                "ok": True,
+                "ignored": True,
+                "reason": "SL_NOT_HIT",
+                "symbol": sym,
+                "pos": {"in_position": in_pos, "side": side, "entry_price": entry_price, "sl_price": sl_price},
+                "bar": {"high": bar_high, "low": bar_low, "close": bar_close},
+                "bar_key_ms": bar_key_ms
+            }), 200
 
-        # Dedup per VECTOR side per bar (allows LONG then SHORT in same bar)
-        if not dedup_safe(sym, f"VECTOR:{side}", bar_key_ms):
-            return jsonify({"ok": True, "ignored": True, "reason": "DUPLICATE_EVENT", "dedup": f"VECTOR:{side}", "bar_key_ms": bar_key_ms}), 200
+        # ==========================================================
+        # 2) STOCH ENTRY + STOCH FLIP (only if bar not already acted)
+        # ==========================================================
+        reason = str(payload.get("reason") or "").strip().upper()  # LD/HD validated earlier
 
-        # Optional warnings for color mismatches
-        if side == "LONG" and color and color not in LONG_COLORS:
-            print("WARN: VECTOR LONG color unexpected:", color)
-        if side == "SHORT" and color and color not in SHORT_COLORS:
-            print("WARN: VECTOR SHORT color unexpected:", color)
+        # Need close for entries/flips (new entry price)
+        if bar_close is None:
+            return jsonify({
+                "ok": True,
+                "ignored": True,
+                "reason": "MISSING_CLOSE_FOR_ENTRY",
+                "symbol": sym,
+                "bar_key_ms": bar_key_ms
+            }), 200
 
-        pos = get_pos(sym)
+        # If already acted in this bar (e.g., other event), ignore
+        # Note: We do NOT claim bar_done here unless we actually take an action.
+        # We read it by attempting to claim right before action.
 
-        # EXIT FIRST (immediate)
-        if pos.get("in_position"):
-            current_side = str(pos.get("side") or "").strip().upper()
-            if current_side == "LONG" and side == "SHORT":
-                set_pos(sym, False, None)
-                # Do NOT clear bias (needed for re-entry)
-                clear_stoch_latch(sym)
-                return jsonify(demo_action("EXIT_LONG", sym, {"trigger": "OPPOSITE_VECTOR", "vector_color": color, "bar_key_ms": bar_key_ms})), 200
+        # FLAT entry
+        if not in_pos or side not in ("LONG", "SHORT"):
+            if reason == "LD":
+                new_side = "LONG"
+                new_entry = bar_close
+                new_sl = calc_sl(new_side, new_entry)
 
-            if current_side == "SHORT" and side == "LONG":
-                set_pos(sym, False, None)
-                clear_stoch_latch(sym)
-                return jsonify(demo_action("EXIT_SHORT", sym, {"trigger": "OPPOSITE_VECTOR", "vector_color": color, "bar_key_ms": bar_key_ms})), 200
+                ok, err = claim_bar_done(sym, bar_key_ms)
+                if err:
+                    return jsonify({"ok": False, "error": "Upstash error (bar_done)", "detail": err}), 503
+                if not ok:
+                    return jsonify({"ok": True, "ignored": True, "reason": "BAR_ALREADY_ACTED", "symbol": sym, "bar_key_ms": bar_key_ms}), 200
 
-            return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_NOT_OPPOSITE", "pos": pos, "vector_side": side, "vector_color": color}), 200
+                ok, err = set_pos(sym, True, new_side, new_entry, new_sl)
+                if err:
+                    return jsonify({"ok": False, "error": "Upstash error (set_pos)", "detail": err}), 503
 
-        # FLAT: RE-ENTRY ONLY (B1)
-        ema50 = get_ema50(sym)
-        bias = get_bias(sym)
+                return jsonify(demo_actions(
+                    ["ENTER_LONG"],
+                    sym,
+                    {
+                        "trigger": "STOCH_LD_PRIMARY",
+                        "entry_price": new_entry,
+                        "sl_price": new_sl,
+                        "bar_key_ms": bar_key_ms,
+                        "ticker": ticker_raw
+                    }
+                )), 200
 
-        if ema50 not in ("ABOVE", "BELOW"):
-            return jsonify({"ok": True, "ignored": True, "reason": "EMA50_UNKNOWN"}), 200
-        if bias not in ("LONG", "SHORT"):
-            return jsonify({"ok": True, "ignored": True, "reason": "BIAS_NOT_ARMED"}), 200
+            # reason == "HD"
+            new_side = "SHORT"
+            new_entry = bar_close
+            new_sl = calc_sl(new_side, new_entry)
 
-        # Enforce EMA50 regime
-        if side == "LONG" and ema50 != "ABOVE":
-            return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_LONG_BLOCKED_BY_EMA50", "ema50": ema50}), 200
-        if side == "SHORT" and ema50 != "BELOW":
-            return jsonify({"ok": True, "ignored": True, "reason": "VECTOR_SHORT_BLOCKED_BY_EMA50", "ema50": ema50}), 200
+            ok, err = claim_bar_done(sym, bar_key_ms)
+            if err:
+                return jsonify({"ok": False, "error": "Upstash error (bar_done)", "detail": err}), 503
+            if not ok:
+                return jsonify({"ok": True, "ignored": True, "reason": "BAR_ALREADY_ACTED", "symbol": sym, "bar_key_ms": bar_key_ms}), 200
 
-        # Require bias match (B1)
-        if side == "LONG" and bias != "LONG":
-            return jsonify({"ok": True, "ignored": True, "reason": "NO_LONG_BIAS"}), 200
-        if side == "SHORT" and bias != "SHORT":
-            return jsonify({"ok": True, "ignored": True, "reason": "NO_SHORT_BIAS"}), 200
+            ok, err = set_pos(sym, True, new_side, new_entry, new_sl)
+            if err:
+                return jsonify({"ok": False, "error": "Upstash error (set_pos)", "detail": err}), 503
 
-        # Execute re-entry
-        if side == "LONG":
-            set_pos(sym, True, "LONG")
-            return jsonify(demo_action("ENTER_LONG", sym, {"trigger": "VECTOR_REENTRY_LONG", "bias": bias, "ema50": ema50, "vector_color": color, "bar_key_ms": bar_key_ms})), 200
-        else:
-            set_pos(sym, True, "SHORT")
-            return jsonify(demo_action("ENTER_SHORT", sym, {"trigger": "VECTOR_REENTRY_SHORT", "bias": bias, "ema50": ema50, "vector_color": color, "bar_key_ms": bar_key_ms})), 200
+            return jsonify(demo_actions(
+                ["ENTER_SHORT"],
+                sym,
+                {
+                    "trigger": "STOCH_HD_PRIMARY",
+                    "entry_price": new_entry,
+                    "sl_price": new_sl,
+                    "bar_key_ms": bar_key_ms,
+                    "ticker": ticker_raw
+                }
+            )), 200
 
-    return jsonify({"ok": True, "ignored": True, "reason": "UNKNOWN_EVENT", "event": event}), 200
+        # In-position flip on opposite stoch
+        if side == "LONG" and reason == "HD":
+            new_side = "SHORT"
+            new_entry = bar_close
+            new_sl = calc_sl(new_side, new_entry)
+
+            ok, err = claim_bar_done(sym, bar_key_ms)
+            if err:
+                return jsonify({"ok": False, "error": "Upstash error (bar_done)", "detail": err}), 503
+            if not ok:
+                return jsonify({"ok": True, "ignored": True, "reason": "BAR_ALREADY_ACTED", "symbol": sym, "bar_key_ms": bar_key_ms}), 200
+
+            ok, err = set_pos(sym, True, new_side, new_entry, new_sl)
+            if err:
+                return jsonify({"ok": False, "error": "Upstash error (set_pos)", "detail": err}), 503
+
+            return jsonify(demo_actions(
+                ["EXIT_LONG", "ENTER_SHORT"],
+                sym,
+                {
+                    "trigger": "STOCH_HD_FLIP",
+                    "from": "LONG",
+                    "to": "SHORT",
+                    "entry_price": new_entry,
+                    "sl_price": new_sl,
+                    "bar_key_ms": bar_key_ms,
+                    "ticker": ticker_raw
+                }
+            )), 200
+
+        if side == "SHORT" and reason == "LD":
+            new_side = "LONG"
+            new_entry = bar_close
+            new_sl = calc_sl(new_side, new_entry)
+
+            ok, err = claim_bar_done(sym, bar_key_ms)
+            if err:
+                return jsonify({"ok": False, "error": "Upstash error (bar_done)", "detail": err}), 503
+            if not ok:
+                return jsonify({"ok": True, "ignored": True, "reason": "BAR_ALREADY_ACTED", "symbol": sym, "bar_key_ms": bar_key_ms}), 200
+
+            ok, err = set_pos(sym, True, new_side, new_entry, new_sl)
+            if err:
+                return jsonify({"ok": False, "error": "Upstash error (set_pos)", "detail": err}), 503
+
+            return jsonify(demo_actions(
+                ["EXIT_SHORT", "ENTER_LONG"],
+                sym,
+                {
+                    "trigger": "STOCH_LD_FLIP",
+                    "from": "SHORT",
+                    "to": "LONG",
+                    "entry_price": new_entry,
+                    "sl_price": new_sl,
+                    "bar_key_ms": bar_key_ms,
+                    "ticker": ticker_raw
+                }
+            )), 200
+
+        return jsonify({
+            "ok": True,
+            "ignored": True,
+            "reason": "STOCH_NOT_OPPOSITE",
+            "symbol": sym,
+            "pos": {"in_position": in_pos, "side": side, "entry_price": entry_price, "sl_price": sl_price},
+            "stoch_reason": reason,
+            "bar_key_ms": bar_key_ms
+        }), 200
+
+    finally:
+        release_lock(sym)
 
 
 # =========================
@@ -448,17 +652,22 @@ def webhook():
 # =========================
 @app.get("/debug/state/<symbol>")
 def debug_state(symbol: str):
-    sym = symbol.strip().upper()
+    sym = symbol.strip().upper().replace(".P", "")
     if sym not in ALLOWED_SYMBOLS:
         return jsonify({"ok": False, "error": "Unknown symbol"}), 400
+
+    pos, err = get_pos(sym)
+    if err:
+        return jsonify({"ok": False, "error": "Upstash error (get_pos)", "detail": err}), 503
+
     return jsonify({
         "ok": True,
         "endpoint": f"/debug/state/{sym}",
         "symbol": sym,
-        "ema50_state": get_ema50(sym),
-        "bias": get_bias(sym),
-        "pos": get_pos(sym),
-        "stoch_latch": get_stoch_latch(sym),
+        "pos": pos,
+        "sl_pct": SL_PCT,
+        "mode": "B1_STOCH_FLIP_SAFE_WITH_SL_REVERSE",
+        "bot_version": BOT_VERSION,
     }), 200
 
 @app.get("/debug/bitmart")
@@ -468,6 +677,9 @@ def debug_bitmart():
         "endpoint": "/debug/bitmart",
         "note": "This build does not execute real orders unless EXECUTION_ENABLED=1",
         "execution_enabled": EXECUTION_ENABLED,
+        "sl_pct": SL_PCT,
+        "mode": "B1_STOCH_FLIP_SAFE_WITH_SL_REVERSE",
+        "bot_version": BOT_VERSION,
     }), 200
 
 
